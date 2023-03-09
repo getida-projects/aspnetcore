@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Components.Infrastructure;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Microsoft.Extensions.DependencyInjection;
@@ -20,10 +21,9 @@ public static class RazorComponentsServiceCollectionExtensions
     {
         services.TryAddSingleton<RazorComponentsMarkerService>();
 
-        // Routing
-        // This can't be a singleton
-        // https://github.com/dotnet/aspnetcore/issues/46980
-        services.TryAddSingleton<RazorComponentEndpointDataSource>();
+        // Endpoints
+        services.TryAddSingleton<RazorComponentEndpointDataSourceFactory>();
+        services.TryAddSingleton<RazorComponentEndpointFactory>();
 
         // TODO: Register common services required for server side rendering
 

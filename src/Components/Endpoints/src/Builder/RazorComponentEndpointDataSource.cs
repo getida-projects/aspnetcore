@@ -3,16 +3,14 @@
 
 using System.Diagnostics;
 using System.Linq;
-using System.Reflection;
-using Microsoft.AspNetCore.Components;
+using Microsoft.AspNetCore.Components.Discovery;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
-using Microsoft.AspNetCore.Routing.Patterns;
 using Microsoft.Extensions.Primitives;
 
 namespace Microsoft.AspNetCore.Builder;
 
-internal class RazorComponentEndpointDataSource : EndpointDataSource
+internal class RazorComponentEndpointDataSource<TRootComponent> : EndpointDataSource
 {
     private readonly object _lock = new object();
     private readonly List<Action<EndpointBuilder>> _conventions = new();
@@ -22,13 +20,20 @@ internal class RazorComponentEndpointDataSource : EndpointDataSource
     private readonly CancellationTokenSource _cancellationTokenSource;
     private readonly IChangeToken _changeToken;
 
-    public RazorComponentEndpointDataSource()
+    public RazorComponentEndpointDataSource(
+        Dictionary<string, List<PageComponentMetadata>> pages,
+        RazorComponentEndpointFactory factory)
     {
-        DefaultBuilder = new RazorComponentEndpointConventionBuilder(_lock, _conventions);
+        _pages = pages;
+        _factory = factory;
+        DefaultBuilder = new RazorComponentEndpointConventionBuilder(_lock, pages, _conventions);
 
         _cancellationTokenSource = new CancellationTokenSource();
         _changeToken = new CancellationChangeToken(_cancellationTokenSource.Token);
     }
+
+    private readonly Dictionary<string, List<PageComponentMetadata>> _pages;
+    private readonly RazorComponentEndpointFactory _factory;
 
     internal RazorComponentEndpointConventionBuilder DefaultBuilder { get; }
 
@@ -66,54 +71,13 @@ internal class RazorComponentEndpointDataSource : EndpointDataSource
 
     private void UpdateEndpoints()
     {
-        // TODO: https://github.com/dotnet/aspnetcore/issues/46980
-
-        var entryPoint = Assembly.GetEntryAssembly() ??
-            throw new InvalidOperationException("Can't find entry assembly.");
-
-        var pages = entryPoint.GetExportedTypes()
-            .Select(t => (type: t, route: t.GetCustomAttribute<RouteAttribute>()))
-            .Where(p => p.route != null);
-
         var endpoints = new List<Endpoint>();
-        foreach (var (type, route) in pages)
+        foreach (var metadata in _pages.Values.SelectMany(v => v))
         {
-            // TODO: Proper endpoint definition https://github.com/dotnet/aspnetcore/issues/46985
-            var endpoint = new RouteEndpoint(
-                CreateRouteDelegate(type),
-                RoutePatternFactory.Parse(route!.Template),
-                order: 0,
-                new EndpointMetadataCollection(type.GetCustomAttributes(inherit: true)),
-                route.Template);
-            endpoints.Add(endpoint);
+            _factory.AddEndpoints(endpoints, metadata, _conventions);
         }
 
         _endpoints = endpoints;
-    }
-
-    private static RequestDelegate CreateRouteDelegate(Type type)
-    {
-        // TODO: Proper endpoint implementation https://github.com/dotnet/aspnetcore/issues/46988
-        return (ctx) =>
-        {
-            ctx.Response.StatusCode = 200;
-            ctx.Response.ContentType = "text/html; charset=utf-8";
-            return ctx.Response.WriteAsync($"""
-<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="X-UA-Compatible" content="ie=edge">
-    <title>{type.FullName}</title>
-    <link rel="stylesheet" href="style.css">
-  </head>
-  <body>
-	<p>{type.FullName}</p>
-  </body>
-</html>
-""");
-        };
     }
 
     public override IChangeToken GetChangeToken()

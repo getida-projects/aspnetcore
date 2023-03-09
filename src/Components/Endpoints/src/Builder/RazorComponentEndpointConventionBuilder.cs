@@ -1,14 +1,17 @@
-﻿// Licensed to the .NET Foundation under one or more agreements.
+// Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
 namespace Microsoft.AspNetCore.Builder;
 
-internal class RazorComponentEndpointConventionBuilder : IEndpointConventionBuilder
+public class RazorComponentEndpointConventionBuilder : IEndpointConventionBuilder
 {
     private readonly object _lock;
     private readonly List<Action<EndpointBuilder>> _conventions;
 
-    internal RazorComponentEndpointConventionBuilder(object @lock, List<Action<EndpointBuilder>> conventions)
+    internal RazorComponentEndpointConventionBuilder(
+        object @lock,
+        Dictionary<string, List<Components.Discovery.PageComponentMetadata>> pages,
+        List<Action<EndpointBuilder>> conventions)
     {
         _lock = @lock;
         _conventions = conventions;
