@@ -11,7 +11,7 @@ using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using Microsoft.AspNetCore.Http.Features;
-using Microsoft.AspNetCore.Http.Generators.StaticRouteHandlerModel;
+using Microsoft.AspNetCore.Http.RequestDelegateGenerator.StaticRouteHandlerModel;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Primitives;
 
@@ -20,13 +20,8 @@ namespace Microsoft.AspNetCore.Http.Generators.Tests;
 public abstract partial class RequestDelegateCreationTests : RequestDelegateCreationTestBase
 {
     [Theory]
-    [InlineData("HttpContext")]
-    [InlineData("HttpRequest")]
-    [InlineData("HttpResponse")]
     [InlineData("System.IO.Pipelines.PipeReader")]
     [InlineData("System.IO.Stream")]
-    [InlineData("System.Security.Claims.ClaimsPrincipal")]
-    [InlineData("System.Threading.CancellationToken")]
     [InlineData("[FromBody] System.IO.Pipelines.PipeReader")]
     [InlineData("[FromBody] System.IO.Stream")]
     public async Task MapAction_SingleSpecialTypeParam_StringReturn(string parameterType)
@@ -38,11 +33,10 @@ app.MapGet("/hello", ({parameterType} p) => p == null ? "null!" : "Hello world!"
 
         VerifyStaticEndpointModel(results, endpointModel =>
         {
-            Assert.Equal("/hello", endpointModel.RoutePattern);
             Assert.Equal("MapGet", endpointModel.HttpMethod);
             var p = Assert.Single(endpointModel.Parameters);
             Assert.Equal(EndpointParameterSource.SpecialType, p.Source);
-            Assert.Equal("p", p.Name);
+            Assert.Equal("p", p.SymbolName);
         });
 
         var httpContext = CreateHttpContext();
@@ -60,19 +54,18 @@ app.MapGet("/hello", (HttpRequest req, HttpResponse res) => req is null || res i
 
         VerifyStaticEndpointModel(results, endpointModel =>
         {
-            Assert.Equal("/hello", endpointModel.RoutePattern);
             Assert.Equal("MapGet", endpointModel.HttpMethod);
 
             Assert.Collection(endpointModel.Parameters,
                 reqParam =>
                 {
                     Assert.Equal(EndpointParameterSource.SpecialType, reqParam.Source);
-                    Assert.Equal("req", reqParam.Name);
+                    Assert.Equal("req", reqParam.SymbolName);
                 },
                 reqParam =>
                 {
                     Assert.Equal(EndpointParameterSource.SpecialType, reqParam.Source);
-                    Assert.Equal("res", reqParam.Name);
+                    Assert.Equal("res", reqParam.SymbolName);
                 });
         });
 
@@ -96,7 +89,7 @@ app.MapGet("/hello", () =>
 
         VerifyStaticEndpointModel(result, endpointModel =>
         {
-            Assert.Equal("/hello", endpointModel.RoutePattern);
+            Assert.Equal("MapGet", endpointModel.HttpMethod);
         });
 
         var httpContext = CreateHttpContext();
@@ -133,34 +126,31 @@ app.MapGet("/zh", (HttpRequest req, HttpResponse res) => "你好世界！");
         VerifyStaticEndpointModels(results, endpointModels => Assert.Collection(endpointModels,
             endpointModel =>
             {
-                Assert.Equal("/en", endpointModel.RoutePattern);
                 Assert.Equal("MapGet", endpointModel.HttpMethod);
                 var reqParam = Assert.Single(endpointModel.Parameters);
                 Assert.Equal(EndpointParameterSource.SpecialType, reqParam.Source);
-                Assert.Equal("req", reqParam.Name);
+                Assert.Equal("req", reqParam.SymbolName);
             },
             endpointModel =>
             {
-                Assert.Equal("/es", endpointModel.RoutePattern);
                 Assert.Equal("MapGet", endpointModel.HttpMethod);
                 var reqParam = Assert.Single(endpointModel.Parameters);
                 Assert.Equal(EndpointParameterSource.SpecialType, reqParam.Source);
-                Assert.Equal("res", reqParam.Name);
+                Assert.Equal("res", reqParam.SymbolName);
             },
             endpointModel =>
             {
-                Assert.Equal("/zh", endpointModel.RoutePattern);
                 Assert.Equal("MapGet", endpointModel.HttpMethod);
                 Assert.Collection(endpointModel.Parameters,
                     reqParam =>
                     {
                         Assert.Equal(EndpointParameterSource.SpecialType, reqParam.Source);
-                        Assert.Equal("req", reqParam.Name);
+                        Assert.Equal("req", reqParam.SymbolName);
                     },
                     reqParam =>
                     {
                         Assert.Equal(EndpointParameterSource.SpecialType, reqParam.Source);
-                        Assert.Equal("res", reqParam.Name);
+                        Assert.Equal("res", reqParam.SymbolName);
                     });
             }));
 
@@ -448,5 +438,165 @@ app.MapGet("/", (HttpContext httpContext, int id) =>
 
         Assert.Equal(42, httpContext.Items["id"]);
         Assert.Equal(200, httpContext.Response.StatusCode);
+    }
+
+    [Fact]
+    public async Task RequestDelegateCreation_SupportMapMethods()
+    {
+        var source = """
+var supportedMethods = new[] { "GET", "POST" };
+app.MapMethods("/", supportedMethods, (HttpContext httpContext, int id) =>
+{
+    httpContext.Items["id"] = id;
+});
+""";
+        var (_, compilation) = await RunGeneratorAsync(source);
+        var endpoint = GetEndpointFromCompilation(compilation);
+
+        var httpContext = CreateHttpContext();
+        httpContext.Request.Query = new QueryCollection(new Dictionary<string, StringValues>
+        {
+            ["id"] = "42",
+        });
+
+        httpContext.Request.Headers.Referer = "https://example.org";
+        await endpoint.RequestDelegate(httpContext);
+
+        Assert.Equal(42, httpContext.Items["id"]);
+        Assert.Equal(200, httpContext.Response.StatusCode);
+    }
+
+    [Fact]
+    public async Task RequestDelegateCreation_SupportMapMethods_InvalidRequestMethod()
+    {
+        var source = """
+var supportedMethods = new[] { "DELETE", "PATCH" };
+app.MapMethods("/", supportedMethods, (HttpContext httpContext, int id) =>
+{
+    httpContext.Items["id"] = id;
+});
+""";
+        var (_, compilation) = await RunGeneratorAsync(source);
+        var endpoint = GetEndpointFromCompilation(compilation);
+
+        var httpContext = CreateHttpContext();
+        httpContext.Request.Method = "GET";
+
+        await endpoint.RequestDelegate(httpContext);
+
+        Assert.Null(httpContext.Items["id"]);
+        Assert.Equal(400, httpContext.Response.StatusCode);
+    }
+
+    [Fact]
+    public async Task RequestDelegateCreation_SupportsMap()
+    {
+        var source = """
+app.Map("/", (HttpContext httpContext, int id) =>
+{
+    httpContext.Items["id"] = id;
+});
+""";
+        var (_, compilation) = await RunGeneratorAsync(source);
+        var endpoint = GetEndpointFromCompilation(compilation);
+
+        var httpContext = CreateHttpContext();
+        httpContext.Request.Query = new QueryCollection(new Dictionary<string, StringValues>
+        {
+            ["id"] = "42",
+        });
+
+        httpContext.Request.Headers.Referer = "https://example.org";
+        await endpoint.RequestDelegate(httpContext);
+
+        Assert.Equal(42, httpContext.Items["id"]);
+        Assert.Equal(200, httpContext.Response.StatusCode);
+    }
+
+    [Fact]
+    public async Task RequestDelegateCreation_SupportsMapFallback()
+    {
+        var source = """
+app.MapFallback("/", (HttpContext httpContext, int id) =>
+{
+    httpContext.Items["id"] = id;
+});
+""";
+        var (_, compilation) = await RunGeneratorAsync(source);
+        var endpoint = GetEndpointFromCompilation(compilation);
+
+        var httpContext = CreateHttpContext();
+        httpContext.Request.Query = new QueryCollection(new Dictionary<string, StringValues>
+        {
+            ["id"] = "42",
+        });
+
+        httpContext.Request.Headers.Referer = "https://example.org";
+        await endpoint.RequestDelegate(httpContext);
+
+        Assert.Equal(42, httpContext.Items["id"]);
+        Assert.Equal(200, httpContext.Response.StatusCode);
+    }
+
+    [Fact]
+    public async Task RequestDelegateCreation_SupportsMapFallback_NoRoute()
+    {
+        var source = """
+app.MapFallback((HttpContext httpContext, int id) =>
+{
+    httpContext.Items["id"] = id;
+});
+""";
+        var (_, compilation) = await RunGeneratorAsync(source);
+        var endpoint = GetEndpointFromCompilation(compilation);
+
+        var httpContext = CreateHttpContext();
+        httpContext.Request.Query = new QueryCollection(new Dictionary<string, StringValues>
+        {
+            ["id"] = "42",
+        });
+
+        httpContext.Request.Headers.Referer = "https://example.org";
+        await endpoint.RequestDelegate(httpContext);
+
+        Assert.Equal(42, httpContext.Items["id"]);
+        Assert.Equal(200, httpContext.Response.StatusCode);
+    }
+
+    [Fact]
+    public async Task RequestDelegateHandlesStringValuesFromExplicitQueryStringSource()
+    {
+        var source = """
+app.MapPost("/", (HttpContext context,
+    [FromHeader(Name = "Custom")] int[] headerValues,
+    [FromQuery(Name = "a")] int[] queryValues,
+    [FromForm(Name = "form")] int[] formValues) =>
+{
+    context.Items["headers"] = headerValues;
+    context.Items["query"] = queryValues;
+    context.Items["form"] = formValues;
+});
+""";
+        var (_, compilation) = await RunGeneratorAsync(source);
+        var endpoint = GetEndpointFromCompilation(compilation);
+        var httpContext = CreateHttpContext();
+
+        httpContext.Request.Query = new QueryCollection(new Dictionary<string, StringValues>
+        {
+            ["a"] = new(new[] { "1", "2", "3" })
+        });
+
+        httpContext.Request.Headers["Custom"] = new(new[] { "4", "5", "6" });
+
+        httpContext.Request.Form = new FormCollection(new Dictionary<string, StringValues>
+        {
+            ["form"] = new(new[] { "7", "8", "9" })
+        });
+
+        await endpoint.RequestDelegate(httpContext);
+
+        Assert.Equal(new[] { 1, 2, 3 }, (int[])httpContext.Items["query"]!);
+        Assert.Equal(new[] { 4, 5, 6 }, (int[])httpContext.Items["headers"]!);
+        Assert.Equal(new[] { 7, 8, 9 }, (int[])httpContext.Items["form"]!);
     }
 }

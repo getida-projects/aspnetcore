@@ -2,12 +2,14 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 import { MonoObject, MonoString, MonoArray } from 'dotnet/dotnet-legacy';
-import { WebAssemblyResourceLoader } from './WebAssemblyResourceLoader';
+import { WebAssemblyStartOptions } from './WebAssemblyStartOptions';
+import { MonoConfig } from 'dotnet';
 
 export interface Platform {
-  start(resourceLoader: WebAssemblyResourceLoader): Promise<void>;
+  load(options: Partial<WebAssemblyStartOptions>, onConfigLoaded?: (loadedConfig: MonoConfig) => void): Promise<void>;
+  start(): Promise<PlatformApi>;
 
-  callEntryPoint(assemblyName: string): Promise<unknown>;
+  callEntryPoint(): Promise<unknown>;
 
   toUint8Array(array: System_Array<unknown>): Uint8Array;
 
@@ -25,6 +27,10 @@ export interface Platform {
 
   beginHeapLock(): HeapLock;
   invokeWhenHeapUnlocked(callback: Function): void;
+}
+
+export type PlatformApi = {
+  invokeLibraryInitializers(functionName: string, args: unknown[]): Promise<void>;
 }
 
 export interface HeapLock {

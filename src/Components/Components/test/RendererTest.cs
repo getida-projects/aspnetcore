@@ -10,7 +10,7 @@ using Microsoft.AspNetCore.Components.HotReload;
 using Microsoft.AspNetCore.Components.Rendering;
 using Microsoft.AspNetCore.Components.RenderTree;
 using Microsoft.AspNetCore.Components.Test.Helpers;
-using Microsoft.AspNetCore.Testing;
+using Microsoft.AspNetCore.InternalTesting;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Microsoft.AspNetCore.Components.Test;
@@ -1333,8 +1333,9 @@ public class RendererTest
     {
         // Arrange
         var renderer = new TestRenderer();
-        var parentComponent = new OuterEventComponent();
-        parentComponent.RenderFragment = (builder) =>
+        var parentComponent = new OuterEventComponent
+        {
+            RenderFragment = (builder) =>
         {
             builder.OpenComponent<EventComponent>(0);
             builder.AddComponentParameter(1, nameof(EventComponent.OnClickAction), (Action)(() =>
@@ -1342,6 +1343,7 @@ public class RendererTest
                 // Do nothing.
             }));
             builder.CloseComponent();
+        }
         };
 
         var parentComponentId = renderer.AssignRootComponentId(parentComponent);
@@ -1432,8 +1434,9 @@ public class RendererTest
     {
         // Arrange
         var renderer = new TestRenderer();
-        var parentComponent = new OuterEventComponent();
-        parentComponent.RenderFragment = (builder) =>
+        var parentComponent = new OuterEventComponent
+        {
+            RenderFragment = (builder) =>
         {
             builder.OpenComponent<EventComponent>(0);
             builder.AddComponentParameter(1, nameof(EventComponent.OnClickAction), (Action)(() =>
@@ -1441,6 +1444,7 @@ public class RendererTest
                 throw new OperationCanceledException();
             }));
             builder.CloseComponent();
+        }
         };
 
         var parentComponentId = renderer.AssignRootComponentId(parentComponent);
@@ -1456,7 +1460,7 @@ public class RendererTest
 
         // Assert
         Assert.Equal(TaskStatus.Canceled, task.Status);
-        await Assert.ThrowsAsync<TaskCanceledException>(() => task);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => task);
     }
 
     [Fact]
@@ -1488,7 +1492,7 @@ public class RendererTest
 
         // Assert
         Assert.Equal(TaskStatus.Canceled, task.Status);
-        await Assert.ThrowsAsync<TaskCanceledException>(() => task);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => task);
     }
 
     [Fact]
@@ -1524,7 +1528,7 @@ public class RendererTest
         // Assert
         Assert.NotNull(arg);
         Assert.Equal(TaskStatus.Canceled, task.Status);
-        await Assert.ThrowsAsync<TaskCanceledException>(() => task);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => task);
     }
 
     [Fact]
@@ -1532,8 +1536,9 @@ public class RendererTest
     {
         // Arrange
         var renderer = new TestRenderer();
-        var parentComponent = new OuterEventComponent();
-        parentComponent.RenderFragment = (builder) =>
+        var parentComponent = new OuterEventComponent
+        {
+            RenderFragment = (builder) =>
         {
             builder.OpenComponent<EventComponent>(0);
             builder.AddComponentParameter(1, nameof(EventComponent.OnClickAction), (Action)(() =>
@@ -1541,6 +1546,7 @@ public class RendererTest
                 throw new InvalidTimeZoneException();
             }));
             builder.CloseComponent();
+        }
         };
 
         var parentComponentId = renderer.AssignRootComponentId(parentComponent);
@@ -1634,8 +1640,9 @@ public class RendererTest
         var tcs = new TaskCompletionSource();
 
         var renderer = new TestRenderer();
-        var parentComponent = new OuterEventComponent();
-        parentComponent.RenderFragment = (builder) =>
+        var parentComponent = new OuterEventComponent
+        {
+            RenderFragment = (builder) =>
         {
             builder.OpenComponent<EventComponent>(0);
             builder.AddComponentParameter(1, nameof(EventComponent.OnClickAsyncAction), (Func<Task>)(async () =>
@@ -1643,6 +1650,7 @@ public class RendererTest
                 await tcs.Task;
             }));
             builder.CloseComponent();
+        }
         };
 
         var parentComponentId = renderer.AssignRootComponentId(parentComponent);
@@ -1743,8 +1751,9 @@ public class RendererTest
         var tcs = new TaskCompletionSource();
 
         var renderer = new TestRenderer();
-        var parentComponent = new OuterEventComponent();
-        parentComponent.RenderFragment = (builder) =>
+        var parentComponent = new OuterEventComponent
+        {
+            RenderFragment = (builder) =>
         {
             builder.OpenComponent<EventComponent>(0);
             builder.AddComponentParameter(1, nameof(EventComponent.OnClickAsyncAction), (Func<Task>)(async () =>
@@ -1753,6 +1762,7 @@ public class RendererTest
                 throw new TaskCanceledException();
             }));
             builder.CloseComponent();
+        }
         };
 
         var parentComponentId = renderer.AssignRootComponentId(parentComponent);
@@ -1861,8 +1871,9 @@ public class RendererTest
         var tcs = new TaskCompletionSource();
 
         var renderer = new TestRenderer();
-        var parentComponent = new OuterEventComponent();
-        parentComponent.RenderFragment = (builder) =>
+        var parentComponent = new OuterEventComponent
+        {
+            RenderFragment = (builder) =>
         {
             builder.OpenComponent<EventComponent>(0);
             builder.AddComponentParameter(1, nameof(EventComponent.OnClickAsyncAction), (Func<Task>)(async () =>
@@ -1871,6 +1882,7 @@ public class RendererTest
                 throw new InvalidTimeZoneException();
             }));
             builder.CloseComponent();
+        }
         };
 
         var parentComponentId = renderer.AssignRootComponentId(parentComponent);
@@ -2322,9 +2334,8 @@ public class RendererTest
 
         // Outer component is still alive and not disposed.
         Assert.False(component.Disposed);
-        var aex = Assert.IsType<AggregateException>(Assert.Single(renderer.HandledExceptions));
-        var innerException = Assert.Single(aex.Flatten().InnerExceptions);
-        Assert.Same(exception1, innerException);
+        var aex = Assert.Single(renderer.HandledExceptions);
+        Assert.Same(exception1, aex);
     }
 
     [Fact]
@@ -2365,8 +2376,11 @@ public class RendererTest
     {
         // Arrange
         var semaphore = new Semaphore(0, 1);
-        var renderer = new TestRenderer { ShouldHandleExceptions = true };
-        renderer.OnExceptionHandled = () => semaphore.Release();
+        var renderer = new TestRenderer
+        {
+            ShouldHandleExceptions = true,
+            OnExceptionHandled = () => semaphore.Release()
+        };
         var exception1 = new InvalidOperationException();
         var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -2407,8 +2421,11 @@ public class RendererTest
     {
         // Arrange
         var semaphore = new Semaphore(0, 1);
-        var renderer = new TestRenderer { ShouldHandleExceptions = true };
-        renderer.OnExceptionHandled = () => semaphore.Release();
+        var renderer = new TestRenderer
+        {
+            ShouldHandleExceptions = true,
+            OnExceptionHandled = () => semaphore.Release()
+        };
         var exception1 = new InvalidOperationException();
         var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -2475,8 +2492,7 @@ public class RendererTest
 
         // Outer component is still alive and not disposed.
         Assert.False(component.Disposed);
-        var aex = Assert.IsType<AggregateException>(Assert.Single(renderer.HandledExceptions));
-        Assert.IsType<TaskCanceledException>(Assert.Single(aex.Flatten().InnerExceptions));
+        Assert.IsType<TaskCanceledException>(Assert.Single(renderer.HandledExceptions));
     }
 
     [Fact]
@@ -2855,7 +2871,7 @@ public class RendererTest
         var component = new TestComponent(builder => { });
 
         // Act/Assert
-        var ex = Assert.Throws<InvalidOperationException>(() => component.TriggerRender());
+        var ex = Assert.Throws<InvalidOperationException>(component.TriggerRender);
         Assert.Equal("The render handle is not yet assigned.", ex.Message);
     }
 
@@ -3272,7 +3288,7 @@ public class RendererTest
         var onAfterRenderCallCountLog = new List<int>();
         var component = new AsyncAfterRenderComponent(afterRenderTcs.Task)
         {
-            OnAfterRenderComplete = () => @event.Set(),
+            OnAfterRenderComplete = @event.Set,
         };
         var renderer = new AsyncUpdateTestRenderer()
         {
@@ -3301,7 +3317,7 @@ public class RendererTest
         var onAfterRenderCallCountLog = new List<int>();
         var component = new AsyncAfterRenderComponent(afterRenderTcs.Task)
         {
-            OnAfterRenderComplete = () => @event.Set(),
+            OnAfterRenderComplete = @event.Set,
         };
         var renderer = new AsyncUpdateTestRenderer()
         {
@@ -3623,7 +3639,7 @@ public class RendererTest
         // Act
         renderer.AssignRootComponentId(component);
         await component.ExternalExceptionDispatch(exception);
-        
+
         // Assert
         Assert.Same(exception, Assert.Single(renderer.HandledExceptions).GetBaseException());
     }
@@ -3639,7 +3655,7 @@ public class RendererTest
         var renderer = new TestRenderer()
         {
             ShouldHandleExceptions = true,
-            OnExceptionHandled = () => { @event.Set(); },
+            OnExceptionHandled = @event.Set,
         };
         var taskToAwait = Task.CompletedTask;
         var component = new TestComponent(builder =>
@@ -4357,14 +4373,7 @@ public class RendererTest
     {
         // Arrange
         var renderer = new InvalidRecursiveRenderer();
-        var component = new CallbackOnRenderComponent(() =>
-        {
-            // The renderer disallows one batch to be started inside another, because that
-            // would violate all kinds of state tracking invariants. It's not something that
-            // would ever happen except if you subclass the renderer and do something unsupported
-            // that commences batches from inside each other.
-            renderer.ProcessPendingRender();
-        });
+        var component = new CallbackOnRenderComponent(renderer.ProcessPendingRender);
         var componentId = renderer.AssignRootComponentId(component);
 
         // Act/Assert
@@ -4399,7 +4408,7 @@ public class RendererTest
         Assert.Throws<InvalidOperationException>(() => parameterView.GetEnumerator());
         Assert.Throws<InvalidOperationException>(() => parameterView.GetValueOrDefault<object>("anything"));
         Assert.Throws<InvalidOperationException>(() => parameterView.SetParameterProperties(new object()));
-        Assert.Throws<InvalidOperationException>(() => parameterView.ToDictionary());
+        Assert.Throws<InvalidOperationException>(parameterView.ToDictionary);
         var ex = Assert.Throws<InvalidOperationException>(() => parameterView.TryGetValue<object>("anything", out _));
 
         // It's enough to assert about one of the messages
@@ -4834,8 +4843,11 @@ public class RendererTest
     {
         // Arrange
         var autoResetEvent = new AutoResetEvent(false);
-        var renderer = new TestRenderer { ShouldHandleExceptions = true };
-        renderer.OnExceptionHandled = () => autoResetEvent.Set();
+        var renderer = new TestRenderer
+        {
+            ShouldHandleExceptions = true,
+            OnExceptionHandled = () => autoResetEvent.Set()
+        };
         var exception1 = new InvalidTimeZoneException();
         var exception2Tcs = new TaskCompletionSource();
         var rootComponent = new TestComponent(builder =>
@@ -4964,6 +4976,130 @@ public class RendererTest
         // Assert
         Assert.False(hotReloadManager.IsSubscribedTo);
     }
+
+    [Fact]
+    public void ThrowsForUnknownRenderMode_OnComponentType()
+    {
+        // Arrange
+        var renderer = new TestRenderer();
+        var component = new TestComponent(builder =>
+        {
+            builder.OpenComponent<ComponentWithUnknownRenderMode>(0);
+            builder.CloseComponent();
+        });
+
+        // Act
+        var componentId = renderer.AssignRootComponentId(component);
+        var ex = Assert.Throws<NotSupportedException>(() => component.TriggerRender());
+        Assert.Contains($"Cannot supply a component of type '{typeof(ComponentWithUnknownRenderMode)}' because the current platform does not support the render mode '{typeof(ComponentWithUnknownRenderMode.UnknownRenderMode)}'.", ex.Message);
+    }
+
+    [Fact]
+    public void ThrowsForUnknownRenderMode_AtCallSite()
+    {
+        // Arrange
+        var renderer = new TestRenderer();
+        var component = new TestComponent(builder =>
+        {
+            builder.OpenComponent<TestComponent>(0);
+            builder.AddComponentRenderMode(new ComponentWithUnknownRenderMode.UnknownRenderMode());
+            builder.CloseComponent();
+        });
+
+        // Act
+        var componentId = renderer.AssignRootComponentId(component);
+        var ex = Assert.Throws<NotSupportedException>(component.TriggerRender);
+        Assert.Contains($"Cannot supply a component of type '{typeof(TestComponent)}' because the current platform does not support the render mode '{typeof(ComponentWithUnknownRenderMode.UnknownRenderMode)}'.", ex.Message);
+    }
+
+    [Fact]
+    public void RenderModeResolverCanSupplyComponent_WithComponentTypeRenderMode()
+    {
+        // Arrange
+        var renderer = new RendererWithRenderModeResolver();
+
+        var component = new TestComponent(builder =>
+        {
+            builder.OpenComponent<ComponentWithRenderMode>(0);
+            builder.AddComponentParameter(1, nameof(MessageComponent.Message), "Some message");
+            builder.CloseComponent();
+        });
+
+        // Act
+        var componentId = renderer.AssignRootComponentId(component);
+        component.TriggerRender();
+
+        // Assert
+        var batch = renderer.Batches.Single();
+        var componentFrames = batch.GetComponentFrames<MessageComponent>();
+        var resolvedComponent = (MessageComponent)componentFrames.Single().Component;
+        Assert.Equal("Some message", resolvedComponent.Message);
+    }
+
+    [Fact]
+    public void RenderModeResolverCanSupplyComponent_CallSiteRenderMode()
+    {
+        // Arrange
+        var renderer = new RendererWithRenderModeResolver();
+
+        var component = new TestComponent(builder =>
+        {
+            builder.OpenComponent<TestComponent>(0);
+            builder.AddComponentParameter(1, nameof(MessageComponent.Message), "Some message");
+            builder.AddComponentRenderMode(new SubstituteComponentRenderMode());
+            builder.CloseComponent();
+        });
+
+        // Act
+        var componentId = renderer.AssignRootComponentId(component);
+        component.TriggerRender();
+
+        // Assert
+        var batch = renderer.Batches.Single();
+        var componentFrames = batch.GetComponentFrames<MessageComponent>();
+        var resolvedComponent = (MessageComponent)componentFrames.Single().Component;
+        Assert.Equal("Some message", resolvedComponent.Message);
+    }
+
+    [HasSubstituteComponentRenderMode]
+    private class ComponentWithRenderMode : IComponent
+    {
+        public void Attach(RenderHandle renderHandle) => throw new NotImplementedException();
+        public Task SetParametersAsync(ParameterView parameters) => throw new NotImplementedException();
+
+        public class HasSubstituteComponentRenderMode : RenderModeAttribute
+        {
+            public override IComponentRenderMode Mode => new SubstituteComponentRenderMode();
+        }
+    }
+
+    [HasUnknownRenderMode]
+    private class ComponentWithUnknownRenderMode : IComponent
+    {
+        public void Attach(RenderHandle renderHandle) => throw new NotImplementedException();
+        public Task SetParametersAsync(ParameterView parameters) => throw new NotImplementedException();
+
+        public class HasUnknownRenderMode : RenderModeAttribute
+        {
+            public override IComponentRenderMode Mode => new UnknownRenderMode();
+        }
+
+        public class UnknownRenderMode : IComponentRenderMode { }
+    }
+
+    private class RendererWithRenderModeResolver : TestRenderer
+    {
+        protected internal override IComponent ResolveComponentForRenderMode(Type componentType, int? parentComponentId, IComponentActivator componentActivator, IComponentRenderMode renderMode)
+        {
+            return renderMode switch
+            {
+                SubstituteComponentRenderMode => componentActivator.CreateInstance(typeof(MessageComponent)),
+                var other => throw new NotSupportedException($"{nameof(RendererWithRenderModeResolver)} should not have received rendermode {other}"),
+            };
+        }
+    }
+
+    private class SubstituteComponentRenderMode : IComponentRenderMode { }
 
     private class TestComponentActivator<TResult> : IComponentActivator where TResult : IComponent, new()
     {

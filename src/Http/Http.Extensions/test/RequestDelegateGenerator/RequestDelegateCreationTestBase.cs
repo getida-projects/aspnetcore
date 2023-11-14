@@ -1,37 +1,45 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.CodeDom.Compiler;
+using System.Collections.Immutable;
 using System.Globalization;
+using System.IO.Pipelines;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.Loader;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http.Features;
-using Microsoft.AspNetCore.Http.Json;
+using Microsoft.AspNetCore.Http.RequestDelegateGenerator;
 using Microsoft.AspNetCore.Routing;
-using Microsoft.AspNetCore.Testing;
+using Microsoft.AspNetCore.InternalTesting;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.Diagnostics;
 using Microsoft.CodeAnalysis.Emit;
 using Microsoft.CodeAnalysis.Text;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyModel;
 using Microsoft.Extensions.DependencyModel.Resolution;
-using Microsoft.Extensions.Options;
 
 namespace Microsoft.AspNetCore.Http.Generators.Tests;
 
 public abstract class RequestDelegateCreationTestBase : LoggedTest
 {
     // Change this to true and run tests in development to regenerate baseline files.
-    public bool RegenerateBaselines => false;
+    public bool RegenerateBaselines = false;
 
     protected abstract bool IsGeneratorEnabled { get; }
 
+    internal static readonly CSharpParseOptions ParseOptions = new CSharpParseOptions(LanguageVersion.Preview).WithFeatures(new[] { new KeyValuePair<string, string>("InterceptorsPreviewNamespaces", "Microsoft.AspNetCore.Http.Generated") });
+    private static readonly Project _baseProject = CreateProject();
+
     internal async Task<(GeneratorRunResult?, Compilation)> RunGeneratorAsync(string sources, params string[] updatedSources)
     {
+        // Create a Roslyn compilation for the syntax tree.
         var compilation = await CreateCompilationAsync(sources);
 
         // Return the compilation immediately if
@@ -44,17 +52,18 @@ public abstract class RequestDelegateCreationTestBase : LoggedTest
         // Configure the generator driver and run
         // the compilation with it if the generator
         // is enabled.
-        var generator = new RequestDelegateGenerator().AsSourceGenerator();
+        var generator = new RequestDelegateGenerator.RequestDelegateGenerator().AsSourceGenerator();
         GeneratorDriver driver = CSharpGeneratorDriver.Create(generators: new[]
             {
                 generator
             },
-            driverOptions: new GeneratorDriverOptions(IncrementalGeneratorOutputKind.None, trackIncrementalGeneratorSteps: true));
+            driverOptions: new GeneratorDriverOptions(IncrementalGeneratorOutputKind.None, trackIncrementalGeneratorSteps: true),
+            parseOptions: ParseOptions);
         driver = driver.RunGeneratorsAndUpdateCompilation(compilation, out var updatedCompilation,
             out var _);
         foreach (var updatedSource in updatedSources)
         {
-            var syntaxTree = CSharpSyntaxTree.ParseText(GetMapActionString(updatedSource), path: $"TestMapActions.cs");
+            var syntaxTree = CSharpSyntaxTree.ParseText(GetMapActionString(updatedSource), path: $"TestMapActions.cs", options: ParseOptions);
             compilation = compilation
                 .ReplaceSyntaxTree(compilation.SyntaxTrees.First(), syntaxTree);
             driver = driver.RunGeneratorsAndUpdateCompilation(compilation, out updatedCompilation,
@@ -67,24 +76,24 @@ public abstract class RequestDelegateCreationTestBase : LoggedTest
         return (Assert.Single(runResult.Results), updatedCompilation);
     }
 
-    internal static StaticRouteHandlerModel.Endpoint GetStaticEndpoint(GeneratorRunResult result, string stepName) =>
+    internal static RequestDelegateGenerator.StaticRouteHandlerModel.Endpoint GetStaticEndpoint(GeneratorRunResult result, string stepName) =>
         Assert.Single(GetStaticEndpoints(result, stepName));
 
-    internal static StaticRouteHandlerModel.Endpoint[] GetStaticEndpoints(GeneratorRunResult result, string stepName)
+    internal static RequestDelegateGenerator.StaticRouteHandlerModel.Endpoint[] GetStaticEndpoints(GeneratorRunResult result, string stepName)
     {
         // We only invoke the generator once in our test scenarios
         if (result.TrackedSteps.TryGetValue(stepName, out var staticEndpointSteps))
         {
             return staticEndpointSteps
                 .SelectMany(step => step.Outputs)
-                .Select(output => Assert.IsType<StaticRouteHandlerModel.Endpoint>(output.Value))
+                .Select(output => Assert.IsType<RequestDelegateGenerator.StaticRouteHandlerModel.Endpoint>(output.Value))
                 .ToArray();
         }
 
-        return Array.Empty<StaticRouteHandlerModel.Endpoint>();
+        return Array.Empty<RequestDelegateGenerator.StaticRouteHandlerModel.Endpoint>();
     }
 
-    internal static void VerifyStaticEndpointModel(GeneratorRunResult? result, Action<StaticRouteHandlerModel.Endpoint> runAssertions)
+    internal static void VerifyStaticEndpointModel(GeneratorRunResult? result, Action<RequestDelegateGenerator.StaticRouteHandlerModel.Endpoint> runAssertions)
     {
         if (result.HasValue)
         {
@@ -92,7 +101,7 @@ public abstract class RequestDelegateCreationTestBase : LoggedTest
         }
     }
 
-    internal static void VerifyStaticEndpointModels(GeneratorRunResult? result, Action<StaticRouteHandlerModel.Endpoint[]> runAssertions)
+    internal static void VerifyStaticEndpointModels(GeneratorRunResult? result, Action<RequestDelegateGenerator.StaticRouteHandlerModel.Endpoint[]> runAssertions)
     {
         if (result.HasValue)
         {
@@ -100,21 +109,22 @@ public abstract class RequestDelegateCreationTestBase : LoggedTest
         }
     }
 
-    internal Endpoint GetEndpointFromCompilation(Compilation compilation, bool? expectSourceKeyOverride = null, IServiceProvider serviceProvider = null) =>
-        Assert.Single(GetEndpointsFromCompilation(compilation, expectSourceKeyOverride, serviceProvider));
+    internal Endpoint GetEndpointFromCompilation(Compilation compilation, bool? expectGeneratedCodeOverride = null, IServiceProvider serviceProvider = null) =>
+        Assert.Single(GetEndpointsFromCompilation(compilation, expectGeneratedCodeOverride, serviceProvider));
 
-    internal Endpoint[] GetEndpointsFromCompilation(Compilation compilation, bool? expectSourceKeyOverride = null, IServiceProvider serviceProvider = null)
+    internal Endpoint[] GetEndpointsFromCompilation(Compilation compilation, bool? expectGeneratedCodeOverride = null, IServiceProvider serviceProvider = null, bool skipGeneratedCodeCheck = false)
     {
         var assemblyName = compilation.AssemblyName!;
         var symbolsName = Path.ChangeExtension(assemblyName, "pdb");
-        var expectSourceKey = (expectSourceKeyOverride ?? true) && IsGeneratorEnabled;
+        var expectGeneratedCode = (expectGeneratedCodeOverride ?? true) && IsGeneratorEnabled;
 
         var output = new MemoryStream();
         var pdb = new MemoryStream();
 
         var emitOptions = new EmitOptions(
             debugInformationFormat: DebugInformationFormat.PortablePdb,
-            pdbFilePath: symbolsName);
+            pdbFilePath: symbolsName,
+            outputNameOverride: $"TestProject-{Guid.NewGuid()}");
 
         var embeddedTexts = new List<EmbeddedText>();
 
@@ -127,7 +137,7 @@ public abstract class RequestDelegateCreationTestBase : LoggedTest
             var sourceText = SourceText.From(buffer, buffer.Length, encoding, canBeEmbedded: true);
 
             var syntaxRootNode = (CSharpSyntaxNode)syntaxTree.GetRoot();
-            var newSyntaxTree = CSharpSyntaxTree.Create(syntaxRootNode, options: null, encoding: encoding, path: syntaxTree.FilePath);
+            var newSyntaxTree = CSharpSyntaxTree.Create(syntaxRootNode, options: ParseOptions, encoding: encoding, path: syntaxTree.FilePath);
 
             compilation = compilation.ReplaceSyntaxTree(syntaxTree, newSyntaxTree);
 
@@ -146,11 +156,10 @@ public abstract class RequestDelegateCreationTestBase : LoggedTest
         var handler = assembly.GetType("TestMapActions")
             ?.GetMethod("MapTestEndpoints", BindingFlags.Public | BindingFlags.Static)
             ?.CreateDelegate<Func<IEndpointRouteBuilder, IEndpointRouteBuilder>>();
-        var sourceKeyType = assembly.GetType("Microsoft.AspNetCore.Builder.SourceKey");
 
         Assert.NotNull(handler);
 
-        var builder = new DefaultEndpointRouteBuilder(new ApplicationBuilder(serviceProvider ?? new EmptyServiceProvider()));
+        var builder = new DefaultEndpointRouteBuilder(new ApplicationBuilder(serviceProvider ?? CreateServiceProvider()));
         _ = handler(builder);
 
         var dataSource = Assert.Single(builder.DataSources);
@@ -158,17 +167,25 @@ public abstract class RequestDelegateCreationTestBase : LoggedTest
         // Trigger Endpoint build by calling getter.
         var endpoints = dataSource.Endpoints.ToArray();
 
+        if (skipGeneratedCodeCheck == true)
+        {
+            return endpoints;
+        }
+
         foreach (var endpoint in endpoints)
         {
-            var sourceKeyMetadata = endpoint.Metadata.FirstOrDefault(metadata => metadata.GetType() == sourceKeyType);
+            var generatedCodeAttribute = endpoint.Metadata.OfType<GeneratedCodeAttribute>().SingleOrDefault();
 
-            if (expectSourceKey)
+            if (expectGeneratedCode)
             {
-                Assert.NotNull(sourceKeyMetadata);
+                Assert.NotNull(generatedCodeAttribute);
+                var generatedCode = Assert.IsType<GeneratedCodeAttribute>(generatedCodeAttribute);
+                Assert.Equal(typeof(RequestDelegateGeneratorSources).Assembly.FullName, generatedCode.Tool);
+                Assert.Equal(typeof(RequestDelegateGeneratorSources).Assembly.GetName().Version?.ToString(), generatedCode.Version);
             }
             else
             {
-                Assert.Null(sourceKeyMetadata);
+                Assert.Null(generatedCodeAttribute);
             }
         }
 
@@ -190,8 +207,6 @@ public abstract class RequestDelegateCreationTestBase : LoggedTest
     {
         var serviceCollection = new ServiceCollection();
         serviceCollection.AddSingleton(LoggerFactory);
-        var jsonOptions = new JsonOptions();
-        serviceCollection.AddSingleton(Options.Create(jsonOptions));
         if (configureServices is not null)
         {
             configureServices(serviceCollection);
@@ -212,17 +227,44 @@ public abstract class RequestDelegateCreationTestBase : LoggedTest
         return httpContext;
     }
 
-    internal static async Task VerifyResponseBodyAsync(HttpContext httpContext, string expectedBody, int expectedStatusCode = 200)
+    internal static async Task<string> GetResponseBodyAsync(HttpContext httpContext)
     {
         var httpResponse = httpContext.Response;
         httpResponse.Body.Seek(0, SeekOrigin.Begin);
         var streamReader = new StreamReader(httpResponse.Body);
-        var body = await streamReader.ReadToEndAsync();
+        return await streamReader.ReadToEndAsync();
+    }
+
+    internal static async Task VerifyResponseJsonBodyAsync<T>(HttpContext httpContext, Action<T> check, int expectedStatusCode = 200)
+    {
+        var body = await GetResponseBodyAsync(httpContext);
+        var deserializedObject = JsonSerializer.Deserialize<T>(body, new JsonSerializerOptions()
+        {
+            PropertyNameCaseInsensitive = true
+        });
+
+        Assert.Equal(expectedStatusCode, httpContext.Response.StatusCode);
+        check(deserializedObject);
+    }
+
+    internal static async Task VerifyResponseJsonNodeAsync(HttpContext httpContext, Action<JsonNode> check, int expectedStatusCode = 200, string expectedContentType = "application/json; charset=utf-8")
+    {
+        var body = await GetResponseBodyAsync(httpContext);
+        var node = JsonNode.Parse(body);
+
+        Assert.Equal(expectedContentType, httpContext.Response.ContentType);
+        Assert.Equal(expectedStatusCode, httpContext.Response.StatusCode);
+        check(node);
+    }
+
+    internal static async Task VerifyResponseBodyAsync(HttpContext httpContext, string expectedBody, int expectedStatusCode = 200)
+    {
+        var body = await GetResponseBodyAsync(httpContext);
         Assert.Equal(expectedStatusCode, httpContext.Response.StatusCode);
         Assert.Equal(expectedBody, body);
     }
 
-    private static string GetMapActionString(string sources) => $$"""
+    internal static string GetMapActionString(string sources, string className = "TestMapActions") => $$"""
 #nullable enable
 using System;
 using System.Collections.Generic;
@@ -241,27 +283,41 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.ModelBinding;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.AspNetCore.Http.Generators.Tests;
+using Microsoft.Extensions.Primitives;
+using Microsoft.Extensions.DependencyInjection;
 
-public static class TestMapActions
+public static class {{className}}
 {
     public static IEndpointRouteBuilder MapTestEndpoints(this IEndpointRouteBuilder app)
     {
         {{sources}}
         return app;
     }
+
+    public static IResult TestResult(this IResultExtensions _) => TypedResults.Text("Hello World!");
 }
 """;
     private static Task<Compilation> CreateCompilationAsync(string sources)
     {
         var source = GetMapActionString(sources);
+        var project = _baseProject.AddDocument("TestMapActions.cs", SourceText.From(source, Encoding.UTF8)).Project;
+        // Create a Roslyn compilation for the syntax tree.
+        return project.GetCompilationAsync();
+    }
+
+    internal static Project CreateProject(Func<CSharpCompilationOptions, CSharpCompilationOptions> modifyCompilationOptions = null)
+    {
         var projectName = $"TestProject-{Guid.NewGuid()}";
+        var compilationOptions = new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary)
+                .WithNullableContextOptions(NullableContextOptions.Enable);
+        if (modifyCompilationOptions is not null)
+        {
+            compilationOptions = modifyCompilationOptions(compilationOptions);
+        }
         var project = new AdhocWorkspace().CurrentSolution
             .AddProject(projectName, projectName, LanguageNames.CSharp)
-            .WithCompilationOptions(new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary)
-                .WithNullableContextOptions(NullableContextOptions.Enable))
-            .WithParseOptions(new CSharpParseOptions(LanguageVersion.CSharp11));
-
-        project = project.AddDocument("TestMapActions.cs", SourceText.From(source, Encoding.UTF8)).Project;
+            .WithCompilationOptions(compilationOptions)
+            .WithParseOptions(ParseOptions);
 
         // Add in required metadata references
         var resolver = new AppLocalResolver();
@@ -274,7 +330,7 @@ public static class TestMapActions
             foreach (var resolveReferencePath in defaultCompileLibrary.ResolveReferencePaths(resolver))
             {
                 // Skip the source generator itself
-                if (resolveReferencePath.Equals(typeof(RequestDelegateGenerator).Assembly.Location, StringComparison.OrdinalIgnoreCase))
+                if (resolveReferencePath.Equals(typeof(RequestDelegateGenerator.RequestDelegateGenerator).Assembly.Location, StringComparison.OrdinalIgnoreCase))
                 {
                     continue;
                 }
@@ -282,8 +338,7 @@ public static class TestMapActions
             }
         }
 
-        // Create a Roslyn compilation for the syntax tree.
-        return project.GetCompilationAsync();
+        return project;
     }
 
     internal async Task VerifyAgainstBaselineUsingFile(Compilation compilation, [CallerMemberName] string callerName = "")
@@ -428,5 +483,14 @@ Actual Line:
         }
 
         public bool CanHaveBody { get; }
+    }
+
+    internal sealed class PipeRequestBodyFeature : IRequestBodyPipeFeature
+    {
+        public PipeRequestBodyFeature(PipeReader pipeReader)
+        {
+            Reader = pipeReader;
+        }
+        public PipeReader Reader { get; set; }
     }
 }

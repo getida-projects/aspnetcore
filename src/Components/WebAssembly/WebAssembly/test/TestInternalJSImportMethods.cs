@@ -17,13 +17,12 @@ internal sealed class TestInternalJSImportMethods : IInternalJSImportMethods
     public string GetApplicationEnvironment()
         => _environment;
 
-    public byte[] GetConfig(string configFile)
-        => null;
-
     public string GetPersistedState()
         => null;
 
-    public void NavigationManager_EnableNavigationInterception() { }
+    public void NavigationManager_EnableNavigationInterception(int rendererId) { }
+
+    public void NavigationManager_ScrollToElement(string id) { }
 
     public string NavigationManager_GetBaseUri()
         => "https://www.example.com/awesome-part-that-will-be-truncated-in-tests";
@@ -31,23 +30,20 @@ internal sealed class TestInternalJSImportMethods : IInternalJSImportMethods
     public string NavigationManager_GetLocationHref()
         => "https://www.example.com/awesome-part-that-will-be-truncated-in-tests/cool";
 
-    public void NavigationManager_SetHasLocationChangingListeners(bool value) { }
+    public void NavigationManager_SetHasLocationChangingListeners(int rendererId, bool value) { }
 
-    public string RegisteredComponents_GetAssembly(int id)
+    public string RegisteredComponents_GetAssembly(int index)
         => string.Empty;
 
-    public int RegisteredComponents_GetId(int index)
-        => 0;
-
-    public string RegisteredComponents_GetParameterDefinitions(int id)
+    public string RegisteredComponents_GetParameterDefinitions(int index)
         => string.Empty;
 
-    public string RegisteredComponents_GetParameterValues(int id)
+    public string RegisteredComponents_GetParameterValues(int index)
         => string.Empty;
 
     public int RegisteredComponents_GetRegisteredComponentsCount()
         => 0;
 
-    public string RegisteredComponents_GetTypeName(int id)
+    public string RegisteredComponents_GetTypeName(int index)
         => string.Empty;
 }

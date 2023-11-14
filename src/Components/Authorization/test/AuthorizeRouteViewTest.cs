@@ -33,8 +33,10 @@ public class AuthorizeRouteViewTest
         serviceCollection.AddSingleton<IAuthorizationService>(_testAuthorizationService);
         serviceCollection.AddSingleton<NavigationManager, TestNavigationManager>();
 
-        _renderer = new TestRenderer(serviceCollection.BuildServiceProvider());
-        _authorizeRouteViewComponent = new AuthorizeRouteView();
+        var services = serviceCollection.BuildServiceProvider();
+        _renderer = new TestRenderer(services);
+        var componentFactory = new ComponentFactory(new DefaultComponentActivator(), _renderer);
+        _authorizeRouteViewComponent = (AuthorizeRouteView)componentFactory.InstantiateComponent(services, typeof(AuthorizeRouteView), null, null);
         _authorizeRouteViewComponentId = _renderer.AssignRootComponentId(_authorizeRouteViewComponent);
     }
 
@@ -424,5 +426,9 @@ public class AuthorizeRouteViewTest
 
     class TestNavigationManager : NavigationManager
     {
+        public TestNavigationManager()
+        {
+            Initialize("https://localhost:85/subdir/", "https://localhost:85/subdir/path?query=value#hash");
+        }
     }
 }

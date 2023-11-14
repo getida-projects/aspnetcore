@@ -27,13 +27,49 @@ namespace Microsoft.AspNetCore.Server.Kestrel.Core;
 public class KestrelServerOptions
 {
     internal const string DisableHttp1LineFeedTerminatorsSwitchKey = "Microsoft.AspNetCore.Server.Kestrel.DisableHttp1LineFeedTerminators";
+    private const string FinOnErrorSwitch = "Microsoft.AspNetCore.Server.Kestrel.FinOnError";
+    internal const string CertificateFileWatchingSwitch = "Microsoft.AspNetCore.Server.Kestrel.DisableCertificateFileWatching";
+    private static readonly bool _finOnError;
+    private static readonly bool _disableCertificateFileWatching;
+
+    static KestrelServerOptions()
+    {
+        AppContext.TryGetSwitch(FinOnErrorSwitch, out _finOnError);
+        AppContext.TryGetSwitch(CertificateFileWatchingSwitch, out _disableCertificateFileWatching);
+    }
 
     // internal to fast-path header decoding when RequestHeaderEncodingSelector is unchanged.
     internal static readonly Func<string, Encoding?> DefaultHeaderEncodingSelector = _ => null;
 
+    // Opt-out flag for back compat. Remove in 9.0 (or make public).
+    internal bool FinOnError { get; set; } = _finOnError;
+
     private Func<string, Encoding?> _requestHeaderEncodingSelector = DefaultHeaderEncodingSelector;
 
     private Func<string, Encoding?> _responseHeaderEncodingSelector = DefaultHeaderEncodingSelector;
+
+    /// <summary>
+    /// In HTTP/1.x, when a request target is in absolute-form (see RFC 9112 Section 3.2.2),
+    /// for example
+    /// <code>
+    /// GET http://www.example.com/path/to/index.html HTTP/1.1
+    /// </code>
+    /// the Host header is redundant.  In fact, the RFC says
+    ///
+    ///   When an origin server receives a request with an absolute-form of request-target,
+    ///   the origin server MUST ignore the received Host header field (if any) and instead
+    ///   use the host information of the request-target.
+    ///
+    /// However, it is still sensible to check whether the request target and Host header match
+    /// because a mismatch might indicate, for example, a spoofing attempt.  Setting this property
+    /// to true bypasses that check and unconditionally overwrites the Host header with the value
+    /// from the request target.
+    /// </summary>
+    /// <remarks>
+    /// This option does not apply to HTTP/2 or HTTP/3.
+    /// </remarks>
+    /// <seealso href="https://datatracker.ietf.org/doc/html/rfc9112#section-3.2.2-8"/>
+    public bool AllowHostHeaderOverride { get; set; }
 
     // The following two lists configure the endpoints that Kestrel should listen to. If both lists are empty, the "urls" config setting (e.g. UseUrls) is used.
     internal List<ListenOptions> CodeBackedListenOptions { get; } = new List<ListenOptions>();
@@ -250,10 +286,14 @@ public class KestrelServerOptions
 
     internal void ApplyDefaultCertificate(HttpsConnectionAdapterOptions httpsOptions)
     {
-        if (httpsOptions.ServerCertificate != null || httpsOptions.ServerCertificateSelector != null)
+        if (httpsOptions.HasServerCertificateOrSelector)
         {
             return;
         }
+
+        // It's important (and currently true) that we don't reach here with https configuration uninitialized because
+        // we might incorrectly favor the development certificate over one specified by the user.
+        Debug.Assert(ApplicationServices.GetRequiredService<IHttpsConfigurationService>().IsInitialized, "HTTPS configuration should have been enabled");
 
         if (TestOverrideDefaultCertificate is X509Certificate2 certificateFromTest)
         {
@@ -276,6 +316,19 @@ public class KestrelServerOptions
         }
 
         httpsOptions.ServerCertificate = DevelopmentCertificate;
+    }
+
+    internal void EnableHttpsConfiguration()
+    {
+        var httpsConfigurationService = ApplicationServices.GetRequiredService<IHttpsConfigurationService>();
+
+        if (!httpsConfigurationService.IsInitialized)
+        {
+            var hostEnvironment = ApplicationServices.GetRequiredService<IHostEnvironment>();
+            var logger = ApplicationServices.GetRequiredService<ILogger<KestrelServer>>();
+            var httpsLogger = ApplicationServices.GetRequiredService<ILogger<HttpsConnectionMiddleware>>();
+            httpsConfigurationService.Initialize(hostEnvironment, logger, httpsLogger);
+        }
     }
 
     internal void Serialize(Utf8JsonWriter writer)
@@ -392,11 +445,13 @@ public class KestrelServerOptions
             throw new InvalidOperationException($"{nameof(ApplicationServices)} must not be null. This is normally set automatically via {nameof(IConfigureOptions<KestrelServerOptions>)}.");
         }
 
-        var hostEnvironment = ApplicationServices.GetRequiredService<IHostEnvironment>();
-        var logger = ApplicationServices.GetRequiredService<ILogger<KestrelServer>>();
-        var httpsLogger = ApplicationServices.GetRequiredService<ILogger<HttpsConnectionMiddleware>>();
-
-        var loader = new KestrelConfigurationLoader(this, config, hostEnvironment, reloadOnChange, logger, httpsLogger);
+        var httpsConfigurationService = ApplicationServices.GetRequiredService<IHttpsConfigurationService>();
+        var certificatePathWatcher = reloadOnChange && !_disableCertificateFileWatching
+            ? new CertificatePathWatcher(
+                ApplicationServices.GetRequiredService<IHostEnvironment>(),
+                ApplicationServices.GetRequiredService<ILogger<CertificatePathWatcher>>())
+            : null;
+        var loader = new KestrelConfigurationLoader(this, config, httpsConfigurationService, certificatePathWatcher, reloadOnChange);
         ConfigurationLoader = loader;
         return loader;
     }

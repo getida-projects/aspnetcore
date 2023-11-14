@@ -9,6 +9,8 @@ using Microsoft.AspNetCore.Mvc;
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
+app.Logger.LogInformation($"Current process ID: {Environment.ProcessId}");
+
 string Plaintext() => "Hello, World!";
 app.MapGet("/plaintext", Plaintext);
 
@@ -27,7 +29,8 @@ inner.AddEndpointFilterFactory((routeContext, next) =>
 
     return async invocationContext =>
     {
-        tags ??= invocationContext.HttpContext.GetEndpoint()?.Metadata.GetMetadata<ITagsMetadata>()?.Tags ?? Array.Empty<string>();
+        var endpoint = invocationContext.HttpContext.GetEndpoint();
+        tags ??= endpoint?.Metadata.GetMetadata<ITagsMetadata>()?.Tags ?? Array.Empty<string>();
 
         Console.WriteLine("Running filter!");
         var result = await next(invocationContext);

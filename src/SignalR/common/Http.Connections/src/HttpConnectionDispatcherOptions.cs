@@ -4,6 +4,7 @@
 using System.IO.Pipelines;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Connections;
 
 namespace Microsoft.AspNetCore.Http.Connections;
 
@@ -108,10 +109,7 @@ public class HttpConnectionDispatcherOptions
         get => _transportSendTimeout;
         set
         {
-            if (value == TimeSpan.Zero)
-            {
-                throw new ArgumentOutOfRangeException(nameof(value));
-            }
+            ArgumentOutOfRangeException.ThrowIfEqual(value, TimeSpan.Zero);
 
             _transportSendTimeout = value;
             TransportSendTimeoutTicks = value.Ticks;
@@ -126,6 +124,14 @@ public class HttpConnectionDispatcherOptions
     /// Closed connections will miss messages sent while closed.
     /// </remarks>
     public bool CloseOnAuthenticationExpiration { get; set; }
+
+    /// <summary>
+    /// Set to allow connections to reconnect with the same <see cref="BaseConnectionContext.ConnectionId"/>.
+    /// </summary>
+    /// <remarks>
+    /// Client still has to negotiate this option.
+    /// </remarks>
+    public bool AllowStatefulReconnects { get; set; }
 
     internal long TransportSendTimeoutTicks { get; private set; }
     internal bool TransportSendTimeoutEnabled => _transportSendTimeout != Timeout.InfiniteTimeSpan;

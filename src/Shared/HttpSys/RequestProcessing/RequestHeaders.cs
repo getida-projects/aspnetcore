@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Collections;
+using System.Diagnostics;
 using System.Linq;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Primitives;
@@ -9,6 +10,8 @@ using Microsoft.Net.Http.Headers;
 
 namespace Microsoft.AspNetCore.HttpSys.Internal;
 
+[DebuggerDisplay("Count = {Count}")]
+[DebuggerTypeProxy(typeof(RequestHeadersDebugView))]
 internal sealed partial class RequestHeaders : IHeaderDictionary
 {
     private IDictionary<string, StringValues>? _extra;
@@ -276,7 +279,7 @@ internal sealed partial class RequestHeaders : IHeaderDictionary
         int observedHeadersCount = 0;
         for (int i = 0; i < HeaderKeys.Length; i++)
         {
-            var header = (HttpSysRequestHeader)HeaderKeys[i];
+            var header = HeaderKeys[i];
             if (HasKnownHeader(header))
             {
                 observedHeaders[observedHeadersCount++] = GetHeaderKeyName(header);
@@ -290,12 +293,20 @@ internal sealed partial class RequestHeaders : IHeaderDictionary
         int observedHeadersCount = 0;
         for (int i = 0; i < HeaderKeys.Length; i++)
         {
-            var header = (HttpSysRequestHeader)HeaderKeys[i];
+            var header = HeaderKeys[i];
             if (HasKnownHeader(header))
             {
                 observedHeadersCount++;
             }
         }
         return observedHeadersCount;
+    }
+
+    private sealed class RequestHeadersDebugView(RequestHeaders dictionary)
+    {
+        private readonly RequestHeaders _dictionary = dictionary;
+
+        [DebuggerBrowsable(DebuggerBrowsableState.RootHidden)]
+        public KeyValuePair<string, string>[] Items => _dictionary.Select(pair => new KeyValuePair<string, string>(pair.Key, pair.Value.ToString())).ToArray();
     }
 }

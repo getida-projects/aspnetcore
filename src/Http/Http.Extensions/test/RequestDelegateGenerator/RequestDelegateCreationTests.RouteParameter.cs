@@ -1,5 +1,9 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Primitives;
+using System.Globalization;
+
 namespace Microsoft.AspNetCore.Http.Generators.Tests;
 
 public abstract partial class RequestDelegateCreationTests
@@ -150,5 +154,81 @@ app.MapGet("/{value}", (string value, HttpContext httpContext) => value);
 
         await endpoint.RequestDelegate(httpContext);
         await VerifyResponseBodyAsync(httpContext, "fromRoute");
+    }
+
+    public static object[][] MapAction_ExplicitRouteParam_RouteNames_Data
+    {
+        get
+        {
+            return new[]
+            {
+                new object[] { "name" },
+                new object[] { "_" },
+                new object[] { "123" },
+                new object[] { "💩" },
+                new object[] { "\r" },
+                new object[] { "\x00E7"  },
+                new object[] { "!!" },
+                new object[] { "\\" },
+                new object[] { "\'" },
+            };
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(MapAction_ExplicitRouteParam_RouteNames_Data))]
+    public async Task MapAction_ExplicitRouteParam_RouteNames(string routeParameterName)
+    {
+        var (_, compilation) = await RunGeneratorAsync($$"""app.MapGet(@"/{{{routeParameterName}}}", ([FromRoute(Name=@"{{routeParameterName}}")] string routeValue) => routeValue);""");
+        var endpoint = GetEndpointFromCompilation(compilation);
+
+        var httpContext = CreateHttpContext();
+        httpContext.Request.RouteValues[routeParameterName] = "test";
+
+        await endpoint.RequestDelegate(httpContext);
+        await VerifyResponseBodyAsync(httpContext, "test", 200);
+    }
+
+    [Fact]
+    public async Task Returns400IfNoMatchingRouteValueForRequiredParam()
+    {
+        var (_, compilation) = await RunGeneratorAsync($$"""app.MapGet(@"/{foo}", (int foo) => foo);""");
+        var endpoint = GetEndpointFromCompilation(compilation);
+
+        const string unmatchedName = "value";
+        const int unmatchedRouteParam = 42;
+
+        var httpContext = CreateHttpContext();
+        httpContext.Request.RouteValues[unmatchedName] = unmatchedRouteParam.ToString(NumberFormatInfo.InvariantInfo);
+
+        var requestDelegate = endpoint.RequestDelegate;
+
+        await requestDelegate(httpContext);
+
+        Assert.Equal(400, httpContext.Response.StatusCode);
+    }
+
+    [Fact]
+    public async Task RequestDelegatePopulatesFromRouteParameterBasedOnParameterName()
+    {
+        const string paramName = "value";
+        const int originalRouteParam = 42;
+
+        var (_, compilation) = await RunGeneratorAsync(
+            $$"""
+            app.MapGet(@"/{{{paramName}}}", (HttpContext httpContext, [FromRoute] int value) => {
+                httpContext.Items.Add("input", value);
+            });
+            """);
+        var endpoint = GetEndpointFromCompilation(compilation);
+
+        var httpContext = CreateHttpContext();
+        httpContext.Request.RouteValues[paramName] = originalRouteParam.ToString(NumberFormatInfo.InvariantInfo);
+
+        var requestDelegate = endpoint.RequestDelegate;
+
+        await requestDelegate(httpContext);
+
+        Assert.Equal(originalRouteParam, httpContext.Items["input"]);
     }
 }

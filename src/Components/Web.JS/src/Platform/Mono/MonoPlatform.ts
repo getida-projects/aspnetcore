@@ -5,20 +5,25 @@
 /* eslint-disable @typescript-eslint/no-non-null-assertion */
 /* eslint-disable no-prototype-builtins */
 import { DotNet } from '@microsoft/dotnet-js-interop';
-import { attachDebuggerHotkey, hasDebuggingEnabled } from './MonoDebugger';
+import { attachDebuggerHotkey } from './MonoDebugger';
 import { showErrorNotification } from '../../BootErrors';
-import { WebAssemblyResourceLoader, LoadingResource } from '../WebAssemblyResourceLoader';
-import { Platform, System_Array, Pointer, System_Object, System_String, HeapLock } from '../Platform';
-import { WebAssemblyBootResourceType } from '../WebAssemblyStartOptions';
-import { BootJsonData, ICUDataMode } from '../BootConfig';
+import { Platform, System_Array, Pointer, System_Object, System_String, HeapLock, PlatformApi } from '../Platform';
+import { WebAssemblyBootResourceType, WebAssemblyStartOptions } from '../WebAssemblyStartOptions';
 import { Blazor } from '../../GlobalExports';
-import { DotnetModuleConfig, EmscriptenModule, AssetEntry, MonoConfig, ModuleAPI } from 'dotnet';
+import { DotnetModuleConfig, EmscriptenModule, MonoConfig, ModuleAPI, RuntimeAPI, GlobalizationMode } from 'dotnet';
 import { BINDINGType, MONOType } from 'dotnet/dotnet-legacy';
+import { fetchAndInvokeInitializers } from '../../JSInitializers/JSInitializers.WebAssembly';
+import { JSInitializer } from '../../JSInitializers/JSInitializers';
+import { WebRendererId } from '../../Rendering/WebRendererId';
 
 // initially undefined and only fully initialized after createEmscriptenModuleInstance()
 export let BINDING: BINDINGType = undefined as any;
 export let MONO: MONOType = undefined as any;
 export let Module: DotnetModuleConfig & EmscriptenModule = undefined as any;
+export let dispatcher: DotNet.ICallDispatcher = undefined as any;
+let MONO_INTERNAL: any = undefined as any;
+let runtime: RuntimeAPI = undefined as any;
+let jsInitializer: JSInitializer;
 
 const uint64HighOrderShift = Math.pow(2, 32);
 const maxSafeNumberHighPart = Math.pow(2, 21) - 1; // The high-order int32 from Number.MAX_SAFE_INTEGER
@@ -37,6 +42,11 @@ function getValueI32(ptr: number) {
 function getValueFloat(ptr: number) {
   return MONO.getF32(ptr);
 }
+
+export function getInitializer() {
+  return jsInitializer;
+}
+
 function getValueU64(ptr: number) {
   // There is no Module.HEAPU64, and Module.getValue(..., 'i64') doesn't work because the implementation
   // treats 'i64' as being the same as 'i32'. Also we must take care to read both halves as unsigned.
@@ -50,17 +60,17 @@ function getValueU64(ptr: number) {
 }
 
 export const monoPlatform: Platform = {
-  start: async function start(resourceLoader: WebAssemblyResourceLoader) {
-    attachDebuggerHotkey(resourceLoader);
-
-    await createRuntimeInstance(resourceLoader);
+  load: function load(options: Partial<WebAssemblyStartOptions>, onConfigLoaded?: (loadedConfig: MonoConfig) => void) {
+    return createRuntimeInstance(options, onConfigLoaded);
   },
 
-  callEntryPoint: async function callEntryPoint(assemblyName: string): Promise<any> {
-    const emptyArray = [[]];
+  start: function start() {
+    return configureRuntimeInstance();
+  },
 
+  callEntryPoint: async function callEntryPoint(): Promise<any> {
     try {
-      await BINDING.call_assembly_entry_point(assemblyName, emptyArray, 'm');
+      await runtime.runMain(runtime.getConfig().mainAssemblyName!, []);
     } catch (error) {
       console.error(error);
       showErrorNotification();
@@ -126,18 +136,7 @@ export const monoPlatform: Platform = {
       return unboxedValue;
     }
 
-    let decodedString: string | null | undefined;
-    if (currentHeapLock) {
-      decodedString = currentHeapLock.stringCache.get(fieldValue);
-      if (decodedString === undefined) {
-        decodedString = BINDING.conv_string(fieldValue as any as System_String);
-        currentHeapLock.stringCache.set(fieldValue, decodedString);
-      }
-    } else {
-      decodedString = BINDING.conv_string(fieldValue as any as System_String);
-    }
-
-    return decodedString;
+    return BINDING.conv_string(fieldValue as any as System_String);
   },
 
   readStructField: function readStructField<T extends Pointer>(baseAddress: Pointer, fieldOffset?: number): T {
@@ -146,7 +145,7 @@ export const monoPlatform: Platform = {
 
   beginHeapLock: function beginHeapLock() {
     assertHeapIsNotLocked();
-    currentHeapLock = new MonoHeapLock();
+    currentHeapLock = MonoHeapLock.create();
     return currentHeapLock;
   },
 
@@ -160,26 +159,18 @@ export const monoPlatform: Platform = {
   },
 };
 
-function importDotnetJs(resourceLoader: WebAssemblyResourceLoader): Promise<ModuleAPI> {
+async function importDotnetJs(startOptions: Partial<WebAssemblyStartOptions>): Promise<ModuleAPI> {
   const browserSupportsNativeWebAssembly = typeof WebAssembly !== 'undefined' && WebAssembly.validate;
   if (!browserSupportsNativeWebAssembly) {
     throw new Error('This browser does not support WebAssembly.');
   }
 
-  // The dotnet.*.js file has a version or hash in its name as a form of cache-busting. This is needed
-  // because it's the only part of the loading process that can't use cache:'no-cache' (because it's
-  // not a 'fetch') and isn't controllable by the developer (so they can't put in their own cache-busting
-  // querystring). So, to find out the exact URL we have to search the boot manifest.
-  const dotnetJsResourceName = Object
-    .keys(resourceLoader.bootConfig.resources.runtime)
-    .filter(n => n.startsWith('dotnet.') && n.endsWith('.js'))[0];
-  const dotnetJsContentHash = resourceLoader.bootConfig.resources.runtime[dotnetJsResourceName];
-  let src = `_framework/${dotnetJsResourceName}`;
+  let src = '_framework/dotnet.js';
 
   // Allow overriding the URI from which the dotnet.*.js file is loaded
-  if (resourceLoader.startOptions.loadBootResource) {
+  if (startOptions.loadBootResource) {
     const resourceType: WebAssemblyBootResourceType = 'dotnetjs';
-    const customSrc = resourceLoader.startOptions.loadBootResource(resourceType, dotnetJsResourceName, src, dotnetJsContentHash);
+    const customSrc = startOptions.loadBootResource(resourceType, 'dotnet.js', src, '', 'js-module-dotnet');
     if (typeof (customSrc) === 'string') {
       src = customSrc;
     } else if (customSrc) {
@@ -188,184 +179,88 @@ function importDotnetJs(resourceLoader: WebAssemblyResourceLoader): Promise<Modu
     }
   }
 
-  // For consistency with WebAssemblyResourceLoader, we only enforce SRI if caching is allowed
-  if (resourceLoader.bootConfig.cacheBootResources) {
-    const scriptElem = document.createElement('link');
-    scriptElem.rel = 'modulepreload';
-    scriptElem.href = src;
-    scriptElem.crossOrigin = 'anonymous';
-    // it will make dynamic import fail if the hash doesn't match
-    // It's currently only validated by chromium browsers
-    // Firefox doesn't break on it, but doesn't validate it either
-    scriptElem.integrity = dotnetJsContentHash;
-    document.head.appendChild(scriptElem);
-  }
-
   const absoluteSrc = (new URL(src, document.baseURI)).toString();
-  return import(/* webpackIgnore: true */ absoluteSrc);
+  return await import(/* webpackIgnore: true */ absoluteSrc);
 }
 
-function prepareRuntimeConfig(resourceLoader: WebAssemblyResourceLoader): DotnetModuleConfig {
-  const resources = resourceLoader.bootConfig.resources;
-
-  const assets: AssetEntry[] = [];
-  const environmentVariables = {};
+function prepareRuntimeConfig(options: Partial<WebAssemblyStartOptions>, onConfigLoadedCallback?: (loadedConfig: MonoConfig) => void): DotnetModuleConfig {
   const config: MonoConfig = {
-    assets,
-    globalizationMode: 'icu',
-    environmentVariables: environmentVariables,
-    debugLevel: hasDebuggingEnabled() ? 1 : 0,
     maxParallelDownloads: 1000000, // disable throttling parallel downloads
     enableDownloadRetry: false, // disable retry downloads
-  };
-  const monoToBlazorAssetTypeMap: { [key: string]: WebAssemblyBootResourceType | undefined } = {
-    'assembly': 'assembly',
-    'pdb': 'pdb',
-    'icu': 'globalization',
-    'vfs': 'globalization',
-    'dotnetwasm': 'dotnetwasm',
-  };
-  const behaviorByName = (name) => {
-    return name === 'dotnet.timezones.blat' ? 'vfs'
-      : (name.startsWith('dotnet.worker') && name.endsWith('.js')) ? 'js-module-threads'
-        : (name.startsWith('dotnet') && name.endsWith('.js')) ? 'js-module-dotnet'
-          : name.startsWith('icudt') ? 'icu'
-            : 'other';
+    applicationEnvironment: options.environment,
   };
 
-  // it would not `loadResource` on types for which there is no typesMap mapping
-  const downloadResource = (asset: AssetEntry): LoadingResource | undefined => {
-    // GOTCHA: the mapping to blazor asset type may not cover all mono owned asset types in the future in which case:
-    // A) we may need to add such asset types to the mapping and to WebAssemblyBootResourceType
-    // B) or we could add generic "runtime" type to WebAssemblyBootResourceType as fallback
-    // C) or we could return `undefined` and let the runtime to load the asset. In which case the progress will not be reported on it and blazor will not be able to cache it.
-    const type = monoToBlazorAssetTypeMap[asset.behavior];
-    if (type !== undefined) {
-      const res = resourceLoader.loadResource(asset.name, asset.resolvedUrl!, asset.hash!, type);
-      asset.pendingDownload = res;
-      totalResources++;
-      res.response.then(setProgress);
-      return res;
+  const onConfigLoaded = async (loadedConfig: MonoConfig) => {
+    if (!loadedConfig.environmentVariables) {
+      loadedConfig.environmentVariables = {};
     }
-    return undefined;
+
+    if (loadedConfig.globalizationMode === GlobalizationMode.Sharded) {
+      loadedConfig.environmentVariables['__BLAZOR_SHARDED_ICU'] = '1';
+    }
+
+    Blazor._internal.getApplicationEnvironment = () => loadedConfig.applicationEnvironment!;
+
+    onConfigLoadedCallback?.(loadedConfig);
+
+    jsInitializer = await fetchAndInvokeInitializers(options, loadedConfig);
   };
-
-  // any runtime owned assets, with proper behavior already set
-  for (const name in resources.runtimeAssets) {
-    const asset = resources.runtimeAssets[name] as AssetEntry;
-    asset.name = name;
-    asset.resolvedUrl = `_framework/${name}`;
-    assets.push(asset);
-    if (asset.behavior === 'dotnetwasm') {
-      // start the download as soon as possible
-      downloadResource(asset);
-    }
-  }
-  for (const name in resources.assembly) {
-    const asset: AssetEntry = {
-      name,
-      resolvedUrl: `_framework/${name}`,
-      hash: resources.assembly[name],
-      behavior: 'assembly',
-    };
-    assets.push(asset);
-    // start the download as soon as possible
-    downloadResource(asset);
-  }
-  if (hasDebuggingEnabled() && resources.pdb) {
-    for (const name in resources.pdb) {
-      const asset: AssetEntry = {
-        name,
-        resolvedUrl: `_framework/${name}`,
-        hash: resources.pdb[name],
-        behavior: 'pdb',
-      };
-      assets.push(asset);
-      downloadResource(asset);
-    }
-  }
-  const applicationCulture = resourceLoader.startOptions.applicationCulture || (navigator.languages && navigator.languages[0]);
-  const icuDataResourceName = getICUResourceName(resourceLoader.bootConfig, applicationCulture);
-  let hasIcuData = false;
-  for (const name in resources.runtime) {
-    const behavior = behaviorByName(name) as any;
-    if (behavior === 'icu') {
-      if (resourceLoader.bootConfig.icuDataMode === ICUDataMode.Invariant) {
-        continue;
-      }
-      if (name !== icuDataResourceName) {
-        continue;
-      }
-      hasIcuData = true;
-    } else if (behavior === 'js-module-dotnet') {
-      continue;
-    }
-    if (resources.runtimeAssets.hasOwnProperty(name)) {
-      continue;
-    }
-    const asset: AssetEntry = {
-      name,
-      resolvedUrl: `_framework/${name}`,
-      hash: resources.runtime[name],
-      behavior,
-    };
-    assets.push(asset);
-    downloadResource(asset);
-  }
-
-  if (!hasIcuData) {
-    config.globalizationMode = 'invariant';
-  }
-
-  if (resourceLoader.bootConfig.modifiableAssemblies) {
-    // Configure the app to enable hot reload in Development.
-    environmentVariables['DOTNET_MODIFIABLE_ASSEMBLIES'] = resourceLoader.bootConfig.modifiableAssemblies;
-  }
-
-  if (resourceLoader.bootConfig.icuDataMode === ICUDataMode.Sharded) {
-    environmentVariables['__BLAZOR_SHARDED_ICU'] = '1';
-  }
-
-  if (resourceLoader.startOptions.applicationCulture) {
-    // If a culture is specified via start options use that to initialize the Emscripten \  .NET culture.
-    environmentVariables['LANG'] = `${resourceLoader.startOptions.applicationCulture}.UTF-8`;
-  }
-
-  if (resourceLoader.bootConfig.aspnetCoreBrowserTools) {
-    // See https://github.com/dotnet/aspnetcore/issues/37357#issuecomment-941237000
-    environmentVariables['__ASPNETCORE_BROWSER_TOOLS'] = resourceLoader.bootConfig.aspnetCoreBrowserTools;
-  }
-
 
   const moduleConfig = (window['Module'] || {}) as typeof Module;
-  // TODO (moduleConfig as any).preloadPlugins = []; // why do we need this ?
   const dotnetModuleConfig: DotnetModuleConfig = {
     ...moduleConfig,
-    configSrc: undefined,
+    onConfigLoaded: (onConfigLoaded as (config: MonoConfig) => void | Promise<void>),
+    onDownloadResourceProgress: setProgress,
     config,
-    downloadResource,
     disableDotnet6Compatibility: false,
-    print,
-    printErr,
+    out: print,
+    err: printErr,
   };
 
   return dotnetModuleConfig;
 }
 
-async function createRuntimeInstance(resourceLoader: WebAssemblyResourceLoader): Promise<void> {
-  const { dotnet } = await importDotnetJs(resourceLoader);
-  const moduleConfig = prepareRuntimeConfig(resourceLoader);
-  (dotnet as any).withModuleConfig(moduleConfig);
+async function createRuntimeInstance(options: Partial<WebAssemblyStartOptions>, onConfigLoaded?: (loadedConfig: MonoConfig) => void): Promise<void> {
+  const { dotnet } = await importDotnetJs(options);
+  const moduleConfig = prepareRuntimeConfig(options, onConfigLoaded);
 
-  const runtime = await dotnet.create();
-  const { MONO: mono, BINDING: binding, Module: module, setModuleImports } = runtime;
+  if (options.applicationCulture) {
+    dotnet.withApplicationCulture(options.applicationCulture);
+  }
+
+  if (options.environment) {
+    dotnet.withApplicationEnvironment(options.environment);
+  }
+
+  if (options.loadBootResource) {
+    dotnet.withResourceLoader(options.loadBootResource);
+  }
+
+  const anyDotnet = (dotnet as any);
+  anyDotnet.withModuleConfig(moduleConfig);
+
+  if (options.configureRuntime) {
+    options.configureRuntime(dotnet);
+  }
+
+  runtime = await dotnet.create();
+}
+
+async function configureRuntimeInstance(): Promise<PlatformApi> {
+  if (!runtime) {
+    throw new Error('The runtime must be loaded it gets configured.');
+  }
+
+  const { MONO: mono, BINDING: binding, Module: module, setModuleImports, INTERNAL: mono_internal, getConfig, invokeLibraryInitializers } = runtime;
   Module = module;
   BINDING = binding;
   MONO = mono;
+  MONO_INTERNAL = mono_internal;
 
+  attachDebuggerHotkey(getConfig());
+
+  Blazor.runtime = runtime;
   Blazor._internal.dotNetCriticalError = printErr;
-  Blazor._internal.loadLazyAssembly = (assemblyNameToLoad) => loadLazyAssembly(resourceLoader, assemblyNameToLoad);
-  Blazor._internal.loadSatelliteAssemblies = (culturesToLoad, loader) => loadSatelliteAssemblies(resourceLoader, culturesToLoad, loader);
   setModuleImports('blazor-internal', {
     Blazor: { _internal: Blazor._internal },
   });
@@ -376,16 +271,13 @@ async function createRuntimeInstance(resourceLoader: WebAssemblyResourceLoader):
     },
   });
   attachInteropInvoker();
-  if (resourceLoader.bootConfig.debugBuild && resourceLoader.bootConfig.cacheBootResources) {
-    resourceLoader.logToConsole();
-  }
-  resourceLoader.purgeUnusedCacheEntriesAsync(); // Don't await - it's fine to run in background
+
+  return {
+    invokeLibraryInitializers,
+  };
 }
 
-let resourcesLoaded = 0;
-let totalResources = 0;
-function setProgress() {
-  resourcesLoaded++;
+function setProgress(resourcesLoaded, totalResources) {
   const percentage = resourcesLoaded / totalResources * 100;
   document.documentElement.style.setProperty('--blazor-load-percentage', `${percentage}%`);
   document.documentElement.style.setProperty('--blazor-load-percentage-text', `"${Math.floor(percentage)}%"`);
@@ -401,61 +293,12 @@ const printErr = line => {
   showErrorNotification();
 };
 
-async function loadSatelliteAssemblies(resourceLoader: WebAssemblyResourceLoader, culturesToLoad: string[], loader: (wrapper: { dll: Uint8Array }) => void): Promise<void> {
-  const satelliteResources = resourceLoader.bootConfig.resources.satelliteResources;
-  if (!satelliteResources) {
-    return;
-  }
-  await Promise.all(culturesToLoad!
-    .filter(culture => satelliteResources.hasOwnProperty(culture))
-    .map(culture => resourceLoader.loadResources(satelliteResources[culture], fileName => `_framework/${fileName}`, 'assembly'))
-    .reduce((previous, next) => previous.concat(next), new Array<LoadingResource>())
-    .map(async resource => {
-      const response = await resource.response;
-      const bytes = await response.arrayBuffer();
-      const wrapper = { dll: new Uint8Array(bytes) };
-      loader(wrapper);
-    }));
-}
-
-async function loadLazyAssembly(resourceLoader: WebAssemblyResourceLoader, assemblyNameToLoad: string): Promise<{ dll: Uint8Array, pdb: Uint8Array | null }> {
-  const resources = resourceLoader.bootConfig.resources;
-  const lazyAssemblies = resources.lazyAssembly;
-  if (!lazyAssemblies) {
-    throw new Error("No assemblies have been marked as lazy-loadable. Use the 'BlazorWebAssemblyLazyLoad' item group in your project file to enable lazy loading an assembly.");
-  }
-
-  const assemblyMarkedAsLazy = lazyAssemblies.hasOwnProperty(assemblyNameToLoad);
-  if (!assemblyMarkedAsLazy) {
-    throw new Error(`${assemblyNameToLoad} must be marked with 'BlazorWebAssemblyLazyLoad' item group in your project file to allow lazy-loading.`);
-  }
-  const dllNameToLoad = changeExtension(assemblyNameToLoad, '.dll');
-  const pdbNameToLoad = changeExtension(assemblyNameToLoad, '.pdb');
-  const shouldLoadPdb = hasDebuggingEnabled() && resources.pdb && lazyAssemblies.hasOwnProperty(pdbNameToLoad);
-
-  const dllBytesPromise = resourceLoader.loadResource(dllNameToLoad, `_framework/${dllNameToLoad}`, lazyAssemblies[dllNameToLoad], 'assembly').response.then(response => response.arrayBuffer());
-  if (shouldLoadPdb) {
-    const pdbBytesPromise = await resourceLoader.loadResource(pdbNameToLoad, `_framework/${pdbNameToLoad}`, lazyAssemblies[pdbNameToLoad], 'pdb').response.then(response => response.arrayBuffer());
-    const [dllBytes, pdbBytes] = await Promise.all([dllBytesPromise, pdbBytesPromise]);
-    return {
-      dll: new Uint8Array(dllBytes),
-      pdb: new Uint8Array(pdbBytes),
-    };
-  } else {
-    const dllBytes = await dllBytesPromise;
-    return {
-      dll: new Uint8Array(dllBytes),
-      pdb: null,
-    };
-  }
-}
-
 function getArrayDataPointer<T>(array: System_Array<T>): number {
   return <number><any>array + 12; // First byte from here is length, then following bytes are entries
 }
 
 function attachInteropInvoker(): void {
-  DotNet.attachDispatcher({
+  dispatcher = DotNet.attachDispatcher({
     beginInvokeDotNetFromJS: (callId: number, assemblyName: string | null, methodIdentifier: string, dotNetObjectId: any | null, argsJson: string): void => {
       assertHeapIsNotLocked();
       if (!dotNetObjectId && !assemblyName) {
@@ -492,41 +335,6 @@ function attachInteropInvoker(): void {
   });
 }
 
-function getICUResourceName(bootConfig: BootJsonData, culture: string | undefined): string {
-  const combinedICUResourceName = 'icudt.dat';
-  if (!culture || bootConfig.icuDataMode === ICUDataMode.All) {
-    return combinedICUResourceName;
-  }
-
-  const prefix = culture.split('-')[0];
-  if ([
-    'en',
-    'fr',
-    'it',
-    'de',
-    'es',
-  ].includes(prefix)) {
-    return 'icudt_EFIGS.dat';
-  } else if ([
-    'zh',
-    'ko',
-    'ja',
-  ].includes(prefix)) {
-    return 'icudt_CJK.dat';
-  } else {
-    return 'icudt_no_CJK.dat';
-  }
-}
-
-function changeExtension(filename: string, newExtensionWithLeadingDot: string) {
-  const lastDotIndex = filename.lastIndexOf('.');
-  if (lastDotIndex < 0) {
-    throw new Error(`No extension to replace in '${filename}'`);
-  }
-
-  return filename.substr(0, lastDotIndex) + newExtensionWithLeadingDot;
-}
-
 function assertHeapIsNotLocked() {
   if (currentHeapLock) {
     throw new Error('Assertion failed - heap is currently locked');
@@ -534,9 +342,6 @@ function assertHeapIsNotLocked() {
 }
 
 class MonoHeapLock implements HeapLock {
-  // Within a given heap lock, it's safe to cache decoded strings since the memory can't change
-  stringCache = new Map<number, string | null>();
-
   // eslint-disable-next-line @typescript-eslint/ban-types
   private postReleaseActions?: Function[];
 
@@ -554,6 +359,8 @@ class MonoHeapLock implements HeapLock {
       throw new Error('Trying to release a lock which isn\'t current');
     }
 
+    MONO_INTERNAL.mono_wasm_gc_unlock();
+
     currentHeapLock = null;
 
     while (this.postReleaseActions?.length) {
@@ -565,5 +372,10 @@ class MonoHeapLock implements HeapLock {
       nextQueuedAction();
       assertHeapIsNotLocked();
     }
+  }
+
+  static create(): MonoHeapLock {
+    MONO_INTERNAL.mono_wasm_gc_lock();
+    return new MonoHeapLock();
   }
 }

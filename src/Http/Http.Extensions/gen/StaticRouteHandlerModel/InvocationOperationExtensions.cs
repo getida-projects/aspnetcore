@@ -1,66 +1,100 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Diagnostics.CodeAnalysis;
+using Microsoft.AspNetCore.App.Analyzers.Infrastructure;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Operations;
 
-namespace Microsoft.AspNetCore.Http.Generators.StaticRouteHandlerModel;
+namespace Microsoft.AspNetCore.Http.RequestDelegateGenerator.StaticRouteHandlerModel;
 
 internal static class InvocationOperationExtensions
 {
-    private const int RoutePatternArgumentOrdinal = 1;
-    private const int RouteHandlerArgumentOrdinal = 2;
-
-    public static bool TryGetRouteHandlerMethod(this IInvocationOperation invocation, out IMethodSymbol method)
+    public static readonly string[] KnownMethods =
     {
-        foreach (var argument in invocation.Arguments)
+        "MapGet",
+        "MapPost",
+        "MapPut",
+        "MapDelete",
+        "MapPatch",
+        "Map",
+        "MapMethods",
+        "MapFallback"
+    };
+
+    public static bool IsValidOperation(this IOperation? operation, WellKnownTypes wellKnownTypes, [NotNullWhen(true)] out IInvocationOperation? invocationOperation)
+    {
+        invocationOperation = null;
+        if (operation is IInvocationOperation targetOperation &&
+            targetOperation.TargetMethod.ContainingNamespace is { Name: "Builder", ContainingNamespace: { Name: "AspNetCore", ContainingNamespace: { Name: "Microsoft", ContainingNamespace.IsGlobalNamespace: true } } } &&
+            targetOperation.TargetMethod.ContainingAssembly.Name is "Microsoft.AspNetCore.Routing" &&
+            targetOperation.TryGetRouteHandlerArgument(out var routeHandlerParameter) &&
+            routeHandlerParameter is { Parameter.Type: {} delegateType } &&
+            SymbolEqualityComparer.Default.Equals(delegateType, wellKnownTypes.Get(WellKnownTypeData.WellKnownType.System_Delegate)))
         {
-            if (argument.Parameter?.Ordinal == RouteHandlerArgumentOrdinal)
-            {
-                method = ResolveMethodFromOperation(argument);
-                return true;
-            }
+            invocationOperation = targetOperation;
+            return true;
         }
-        method = null;
         return false;
     }
 
-    public static bool TryGetRouteHandlerPattern(this IInvocationOperation invocation, out SyntaxToken token)
+    public static bool TryGetRouteHandlerMethod(this IInvocationOperation invocation, SemanticModel semanticModel, [NotNullWhen(true)] out IMethodSymbol? method)
     {
-        IArgumentOperation? argumentOperation = null;
-        foreach (var argument in invocation.Arguments)
+        method = null;
+        if (invocation.TryGetRouteHandlerArgument(out var argument))
         {
-            if (argument.Parameter?.Ordinal == RoutePatternArgumentOrdinal)
-            {
-                argumentOperation = argument;
-            }
+            method = ResolveMethodFromOperation(argument, semanticModel);
+            return method is not null;
         }
-        if (argumentOperation?.Syntax is not ArgumentSyntax routePatternArgumentSyntax ||
-            routePatternArgumentSyntax.Expression is not LiteralExpressionSyntax routePatternArgumentLiteralSyntax)
-        {
-            token = default;
-            return false;
-        }
-        token = routePatternArgumentLiteralSyntax.Token;
-        return true;
+        return false;
     }
 
-    private static IMethodSymbol ResolveMethodFromOperation(IOperation operation) => operation switch
+    public static bool TryGetRouteHandlerArgument(this IInvocationOperation invocation, [NotNullWhen(true)] out IArgumentOperation? argumentOperation)
     {
-        IArgumentOperation argument => ResolveMethodFromOperation(argument.Value),
-        IConversionOperation conv => ResolveMethodFromOperation(conv.Operand),
-        IDelegateCreationOperation del => ResolveMethodFromOperation(del.Target),
-        IFieldReferenceOperation { Field.IsReadOnly: true } f when ResolveDeclarationOperation(f.Field, operation.SemanticModel) is IOperation op =>
-            ResolveMethodFromOperation(op),
+        argumentOperation = null;
+        // Route handler argument is assumed to be the last parameter provided to
+        // the Map methods.
+        var routeHandlerArgumentOrdinal = invocation.Arguments.Length - 1;
+        foreach (var argument in invocation.Arguments)
+        {
+            if (argument.Parameter?.Ordinal == routeHandlerArgumentOrdinal)
+            {
+                argumentOperation = argument;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public static bool TryGetMapMethodName(this SyntaxNode node, out string? methodName)
+    {
+        methodName = default;
+        // Given an invocation like app.MapGet, app.Map, app.MapFallback, etc. get
+        // the value of the Map method being access on the the WebApplication `app`.
+        if (node is InvocationExpressionSyntax { Expression: MemberAccessExpressionSyntax { Name: { Identifier: { ValueText: var method } } } })
+        {
+            methodName = method;
+            return true;
+        }
+        return false;
+    }
+
+    private static IMethodSymbol? ResolveMethodFromOperation(IOperation operation, SemanticModel semanticModel) => operation switch
+    {
+        IArgumentOperation argument => ResolveMethodFromOperation(argument.Value, semanticModel),
+        IConversionOperation conv => ResolveMethodFromOperation(conv.Operand, semanticModel),
+        IDelegateCreationOperation del => ResolveMethodFromOperation(del.Target, semanticModel),
+        IFieldReferenceOperation { Field.IsReadOnly: true } f when ResolveDeclarationOperation(f.Field, semanticModel) is IOperation op =>
+            ResolveMethodFromOperation(op, semanticModel),
         IAnonymousFunctionOperation anon => anon.Symbol,
         ILocalFunctionOperation local => local.Symbol,
         IMethodReferenceOperation method => method.Method,
-        IParenthesizedOperation parenthesized => ResolveMethodFromOperation(parenthesized.Operand),
+        IParenthesizedOperation parenthesized => ResolveMethodFromOperation(parenthesized.Operand, semanticModel),
         _ => null
     };
 
-    private static IOperation ResolveDeclarationOperation(ISymbol symbol, SemanticModel semanticModel)
+    private static IOperation? ResolveDeclarationOperation(ISymbol symbol, SemanticModel? semanticModel)
     {
         foreach (var syntaxReference in symbol.DeclaringSyntaxReferences)
         {
@@ -75,7 +109,8 @@ internal static class InvocationOperationExtensions
                 })
             {
                 // Use the correct semantic model based on the syntax tree
-                var operation = semanticModel.GetOperation(expr);
+                var targetSemanticModel = semanticModel?.Compilation.GetSemanticModel(expr.SyntaxTree);
+                var operation = targetSemanticModel?.GetOperation(expr);
 
                 if (operation is not null)
                 {

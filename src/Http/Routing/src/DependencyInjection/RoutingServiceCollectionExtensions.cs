@@ -43,6 +43,9 @@ public static class RoutingServiceCollectionExtensions
     {
         ArgumentNullException.ThrowIfNull(services);
 
+        // Required for IMeterFactory dependency.
+        services.AddMetrics();
+
         services.TryAddTransient<IInlineConstraintResolver, DefaultInlineConstraintResolver>();
         services.TryAddTransient<ObjectPoolProvider, DefaultObjectPoolProvider>();
         services.TryAddSingleton<ObjectPool<UriBuildingContext>>(s =>
@@ -108,6 +111,7 @@ public static class RoutingServiceCollectionExtensions
         //
         services.TryAddSingleton<TemplateBinderFactory, DefaultTemplateBinderFactory>();
         services.TryAddSingleton<RoutePatternTransformer, DefaultRoutePatternTransformer>();
+        services.TryAddSingleton<RoutingMetrics>();
 
         // Set RouteHandlerOptions.ThrowOnBadRequest in development
         services.TryAddEnumerable(ServiceDescriptor.Transient<IConfigureOptions<RouteHandlerOptions>, ConfigureRouteHandlerOptions>());

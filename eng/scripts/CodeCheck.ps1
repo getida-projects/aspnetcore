@@ -218,7 +218,7 @@ try {
 
     # Temporary: Disable check for blazor js file and nuget.config (updated automatically for
     # internal builds)
-    $changedFilesExclusions = @("src/Components/Web.JS/dist/Release/blazor.server.js", "NuGet.config")
+    $changedFilesExclusions = @("src/Components/Web.JS/dist/Release/blazor.server.js", "src/Components/Web.JS/dist/Release/blazor.web.js", "NuGet.config")
 
     if ($changedFiles) {
         foreach ($file in $changedFiles) {
@@ -253,7 +253,7 @@ try {
                     }
                 }
                 # Check for changes in Unshipped in servicing branches
-                if ($targetBranch -like 'release*' -and $targetBranch -notlike '*preview*' -and $file -like '*PublicAPI.Unshipped.txt') {
+                if ($targetBranch -like 'release*' -and $targetBranch -notlike '*preview*' -and $targetBranch -notlike '*rc1*' -and $targetBranch -notlike '*rc2*' -and $file -like '*PublicAPI.Unshipped.txt') {
                     $changedAPIBaselines.Add($file)
                 }
             }
@@ -263,7 +263,8 @@ try {
 
         if ($changedAPIBaselines.count -gt 0) {
             LogError ("Detected modification to baseline API files. PublicAPI.Shipped.txt files should only " +
-                "be updated after a major release. See /docs/APIBaselines.md for more information.")
+                "be updated after a major release, and PublicAPI.Unshipped.txt files should not " +
+                "be updated in release branches. See /docs/APIBaselines.md for more information.")
             LogError "Modified API baseline files:"
             foreach ($file in $changedAPIBaselines) {
                 LogError $file

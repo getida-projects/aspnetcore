@@ -6,42 +6,43 @@ using System.Collections.Generic;
 using System.Linq;
 using Microsoft.AspNetCore.Analyzers.Infrastructure;
 using Microsoft.AspNetCore.App.Analyzers.Infrastructure;
-using Microsoft.AspNetCore.Http.Generators.StaticRouteHandlerModel.Emitters;
+using Microsoft.AspNetCore.Http.RequestDelegateGenerator.StaticRouteHandlerModel.Emitters;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Operations;
 
-namespace Microsoft.AspNetCore.Http.Generators.StaticRouteHandlerModel;
+namespace Microsoft.AspNetCore.Http.RequestDelegateGenerator.StaticRouteHandlerModel;
 
 internal class Endpoint
 {
-    public Endpoint(IInvocationOperation operation, WellKnownTypes wellKnownTypes)
+    public Endpoint(IInvocationOperation operation, WellKnownTypes wellKnownTypes, SemanticModel semanticModel)
     {
         Operation = operation;
         Location = GetLocation(operation);
         HttpMethod = GetHttpMethod(operation);
         EmitterContext = new EmitterContext();
 
-        if (!operation.TryGetRouteHandlerPattern(out var routeToken))
-        {
-            Diagnostics.Add(Diagnostic.Create(DiagnosticDescriptors.UnableToResolveRoutePattern, Operation.Syntax.GetLocation()));
-            return;
-        }
-
-        RoutePattern = routeToken.ValueText;
-
-        if (!operation.TryGetRouteHandlerMethod(out var method))
+        if (!operation.TryGetRouteHandlerMethod(semanticModel, out var method))
         {
             Diagnostics.Add(Diagnostic.Create(DiagnosticDescriptors.UnableToResolveMethod, Operation.Syntax.GetLocation()));
             return;
         }
 
         Response = new EndpointResponse(method, wellKnownTypes);
-        EmitterContext.HasJsonResponse = !(Response.ResponseType.IsSealed || Response.ResponseType.IsValueType);
-        IsAwaitable = Response.IsAwaitable;
+        Response.EmitRequiredDiagnostics(Diagnostics, Operation.Syntax.GetLocation());
+        IsAwaitable = Response?.IsAwaitable == true;
+
+        EmitterContext.HasResponseMetadata = Response is { } response && !(response.IsIResult || response.HasNoResponse);
+
+        // NOTE: We set this twice. It is possible that we don't have any parameters so we
+        //       want this to be true if the response type implements IEndpointMetadataProvider.
+        //       Later on we set this to be true if the parameters or the response type
+        //       implement the interface.
+        EmitterContext.HasEndpointMetadataProvider = Response!.IsEndpointMetadataProvider;
 
         if (method.Parameters.Length == 0)
         {
+            EmitterContext.RequiresLoggingHelper = false;
             return;
         }
 
@@ -49,12 +50,17 @@ internal class Endpoint
 
         for (var i = 0; i < method.Parameters.Length; i++)
         {
-            var parameter = new EndpointParameter(method.Parameters[i], wellKnownTypes);
+            var parameterSymbol = method.Parameters[i];
+            parameterSymbol.EmitRequiredDiagnostics(Diagnostics, Operation.Syntax.GetLocation());
+            if (Diagnostics.Count > 0)
+            {
+                continue;
+            }
+            var parameter = new EndpointParameter(this, parameterSymbol, wellKnownTypes);
 
             switch (parameter.Source)
             {
                 case EndpointParameterSource.BindAsync:
-                    IsAwaitable = true;
                     switch (parameter.BindMethod)
                     {
                         case BindabilityMethod.IBindableFromHttpContext:
@@ -63,15 +69,11 @@ internal class Endpoint
                             break;
                     }
                     break;
-                case EndpointParameterSource.JsonBody:
-                case EndpointParameterSource.JsonBodyOrService:
-                    IsAwaitable = true;
-                    break;
                 case EndpointParameterSource.Unknown:
                     Diagnostics.Add(Diagnostic.Create(
                         DiagnosticDescriptors.UnableToResolveParameterDescriptor,
                         Operation.Syntax.GetLocation(),
-                        parameter.Name));
+                        parameter.SymbolName));
                     break;
             }
 
@@ -80,23 +82,22 @@ internal class Endpoint
 
         Parameters = parameters;
 
-        EmitterContext.HasJsonBodyOrService = Parameters.Any(parameter => parameter.Source == EndpointParameterSource.JsonBodyOrService);
-        EmitterContext.HasJsonBody = Parameters.Any(parameter => parameter.Source == EndpointParameterSource.JsonBody);
-        EmitterContext.HasRouteOrQuery = Parameters.Any(parameter => parameter.Source == EndpointParameterSource.RouteOrQuery);
-        EmitterContext.HasBindAsync = Parameters.Any(parameter => parameter.Source == EndpointParameterSource.BindAsync);
-        EmitterContext.HasParsable = Parameters.Any(parameter => parameter.IsParsable);
+        EmitterContext.RequiresLoggingHelper = !Parameters.All(parameter =>
+            parameter is not null &&
+            parameter.Source == EndpointParameterSource.SpecialType ||
+            parameter is { IsArray: true, ElementType.SpecialType: SpecialType.System_String, Source: EndpointParameterSource.Query });
     }
 
     public string HttpMethod { get; }
-    public bool IsAwaitable { get; }
+    public bool IsAwaitable { get; set; }
     public bool NeedsParameterArray { get; }
     public string? RoutePattern { get; }
-    public EmitterContext EmitterContext { get;  }
+    public EmitterContext EmitterContext { get; }
     public EndpointResponse? Response { get; }
     public EndpointParameter[] Parameters { get; } = Array.Empty<EndpointParameter>();
     public List<Diagnostic> Diagnostics { get; } = new List<Diagnostic>();
 
-    public (string File, int LineNumber) Location { get; }
+    public (string File, int LineNumber, int CharacterNumber) Location { get; }
     public IInvocationOperation Operation { get; }
 
     public override bool Equals(object o) =>
@@ -107,7 +108,7 @@ internal class Endpoint
 
     public static bool SignatureEquals(Endpoint a, Endpoint b)
     {
-        if (!a.Response.WrappedResponseType.Equals(b.Response.WrappedResponseType, StringComparison.Ordinal) ||
+        if (!string.Equals(a.Response?.WrappedResponseType, b.Response?.WrappedResponseType, StringComparison.Ordinal) ||
             !a.HttpMethod.Equals(b.HttpMethod, StringComparison.Ordinal) ||
             a.Parameters.Length != b.Parameters.Length)
         {
@@ -128,7 +129,7 @@ internal class Endpoint
     public static int GetSignatureHashCode(Endpoint endpoint)
     {
         var hashCode = new HashCode();
-        hashCode.Add(endpoint.Response.WrappedResponseType);
+        hashCode.Add(endpoint.Response?.WrappedResponseType);
         hashCode.Add(endpoint.HttpMethod);
 
         foreach (var parameter in endpoint.Parameters)
@@ -139,12 +140,25 @@ internal class Endpoint
         return hashCode.ToHashCode();
     }
 
-    private static (string, int) GetLocation(IInvocationOperation operation)
+    private static (string, int, int) GetLocation(IInvocationOperation operation)
     {
-        var filePath = operation.Syntax.SyntaxTree.FilePath;
-        var span = operation.Syntax.SyntaxTree.GetLineSpan(operation.Syntax.Span);
-        var lineNumber = span.StartLinePosition.Line + 1;
-        return (filePath, lineNumber);
+        // The invocation expression consists of two properties:
+        // - Expression: which is a `MemberAccessExpressionSyntax` that represents the method being invoked.
+        // - ArgumentList: the list of arguments being invoked.
+        // Here, we resolve the `MemberAccessExpressionSyntax` to get the location of the method being invoked.
+        var memberAccessorExpression = ((MemberAccessExpressionSyntax)((InvocationExpressionSyntax)operation.Syntax).Expression);
+        // The `MemberAccessExpressionSyntax` in turn includes three properties:
+        // - Expression: the expression that is being accessed.
+        // - OperatorToken: the operator token, typically the dot separate.
+        // - Name: the name of the member being accessed, typically `MapGet` or `MapPost`, etc.
+        // Here, we resolve the `Name` to extract the location of the method being invoked.
+        var invocationNameSpan = memberAccessorExpression.Name.Span;
+        // Resolve LineSpan associated with the name span so we can resolve the line and character number.
+        var lineSpan = operation.Syntax.SyntaxTree.GetLineSpan(invocationNameSpan);
+        // Resolve the filepath of the invocation while accounting for source mapped paths.
+        var filePath = operation.Syntax.SyntaxTree.GetInterceptorFilePath(operation.SemanticModel?.Compilation.Options.SourceReferenceResolver);
+        // LineSpan.LinePosition is 0-indexed, but we want to display 1-indexed line and character numbers in the interceptor attribute.
+        return (filePath, lineSpan.StartLinePosition.Line + 1, lineSpan.StartLinePosition.Character + 1);
     }
 
     private static string GetHttpMethod(IInvocationOperation operation)
